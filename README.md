@@ -56,6 +56,8 @@ costrict-router login --base-url https://www.abc.com
 
 命令会输出一个登录链接。复制到浏览器打开，完成登录后回到终端等待即可
 
+> `login` 命令通常只需要执行一次，以后直接 `start` 启动服务即可  
+
 ### 2. 启动本地服务
 
 ```bash
@@ -306,3 +308,8 @@ curl http://127.0.0.1:14567/healthz
 ```bash
 costrict-router stop
 ```
+
+### 开机自动启动服务
+
+直接向你的模型提问 **我有一个编译后的二进制命令行可执行程序，启动命令是 `./costrict-router start`，我要如何将其设定为开机自动启动？ Windows 系统**  
+根据实际情况替换末尾的系统名称即可。也可以直接叫 agent 帮你搞定
