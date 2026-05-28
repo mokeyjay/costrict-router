@@ -136,11 +136,33 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=match,pattern=v(.*),group=1
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: Prepare Docker tags
+        id: docker-tags
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          VERSION: ${{ github.ref_name }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+
+          tags="${META_TAGS}"
+          if [[ "${VERSION#v}" != *-* ]]; then
+            tags="${tags}"$'\n'"${REGISTRY}/${IMAGE_NAME}:latest"
+          fi
+
+          {
+            echo "tags<<EOF"
+            echo "${tags}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Build and push container image
         uses: docker/build-push-action@v7
@@ -148,7 +170,7 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.docker-tags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
   release:
