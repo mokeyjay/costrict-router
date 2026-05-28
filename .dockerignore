@@ -1,0 +1,14 @@
+.git
+.github
+.DS_Store
+
+build/
+dist/
+tmp/
+coverage/
+
+costrict-router
+costrict-router-*
+*.exe
+*.tar.gz
+*.zip

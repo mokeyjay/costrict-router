@@ -30,6 +30,8 @@ _单文件 • 跨平台 • 自动续期 • 多格式兼容_
 
 ## 📦 安装
 
+### 本地运行
+
 在 [Release](https://github.com/mokeyjay/costrict-router/releases/latest) 下载对应系统和架构的压缩包，解压即可
 
 | 系统 | 架构 | 下载文件 |
@@ -40,6 +42,10 @@ _单文件 • 跨平台 • 自动续期 • 多格式兼容_
 | Linux ARM64 | arm64 | `costrict-router_<version>_linux_arm64.tar.gz` |
 | Windows x86_64 | amd64 | `costrict-router_<version>_windows_amd64.zip` |
 | Windows ARM64 | arm64 | `costrict-router_<version>_windows_arm64.zip` |
+
+### Docker 部署
+
+见 [高级用法](./docs/advanced-usage.md)
 
 ## 🚀 快速开始
 
