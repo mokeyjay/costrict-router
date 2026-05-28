@@ -129,7 +129,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Extract Docker metadata
         id: meta
@@ -139,6 +139,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=v(.*),group=1
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Build and push container image
@@ -175,10 +176,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          release_flags=()
+          if [[ "${VERSION#v}" == *-* ]]; then
+            release_flags+=(--prerelease --latest=false)
+          else
+            release_flags+=(--prerelease=false --latest)
+          fi
+
           if gh release view "${VERSION}" >/dev/null 2>&1; then
+            gh release edit "${VERSION}" \
+              --title "${VERSION}" \
+              --notes "Release ${VERSION}" \
+              "${release_flags[@]}"
             gh release upload "${VERSION}" dist/* --clobber
           else
             gh release create "${VERSION}" dist/* \
               --title "${VERSION}" \
-              --notes "Release ${VERSION}"
+              --notes "Release ${VERSION}" \
+              "${release_flags[@]}"
           fi
