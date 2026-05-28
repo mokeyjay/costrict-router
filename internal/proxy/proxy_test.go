@@ -69,6 +69,91 @@ func TestForwardChatAddsCostrictHeaders(t *testing.T) {
 	}
 }
 
+func TestForwardResponsesConvertsThroughChatCompletions(t *testing.T) {
+	apiKey, apiKeyHash := localAPIKeyForTest(t)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/chat-rag/api/v1/chat/completions" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), `"messages"`) || !strings.Contains(string(body), `"hello"`) {
+			t.Fatalf("upstream body = %s", body)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl_1","model":"glm-5","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`)),
+		}, nil
+	})}
+	handler := testHandler(apiKeyHash, client)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"glm-5","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"object":"response"`) || !strings.Contains(rec.Body.String(), `"output_text":"hi"`) {
+		t.Fatalf("response body = %s", rec.Body.String())
+	}
+}
+
+func TestForwardAnthropicMessagesConvertsThroughChatCompletions(t *testing.T) {
+	apiKey, apiKeyHash := localAPIKeyForTest(t)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/chat-rag/api/v1/chat/completions" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), `"messages"`) || !strings.Contains(string(body), `"hello"`) {
+			t.Fatalf("upstream body = %s", body)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl_1","model":"glm-5","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}`)),
+		}, nil
+	})}
+	handler := testHandler(apiKeyHash, client)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"glm-5","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"type":"message"`) || !strings.Contains(rec.Body.String(), `"text":"hi"`) {
+		t.Fatalf("response body = %s", rec.Body.String())
+	}
+}
+
+func TestResponsesRejectsPreviousResponseWithoutInput(t *testing.T) {
+	apiKey, apiKeyHash := localAPIKeyForTest(t)
+	called := false
+	handler := testHandler(apiKeyHash, &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		called = true
+		return nil, nil
+	})})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"glm-5","previous_response_id":"resp_1"}`))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if called {
+		t.Fatal("upstream was called for unsupported previous_response_id request")
+	}
+}
+
 func TestForwardRequiresLocalAPIKey(t *testing.T) {
 	// 本地 /v1 入口必须先校验本地 API Key，失败时不能触达上游。
 	apiKey, apiKeyHash := localAPIKeyForTest(t)
@@ -312,6 +397,21 @@ func localAPIKeyForTest(t *testing.T) (string, string) {
 		t.Fatal(err)
 	}
 	return apiKey, hash
+}
+
+func testHandler(apiKeyHash string, client *http.Client) *Handler {
+	return &Handler{
+		Tokens: &fakeTokens{cfg: config.Config{
+			BaseURL:         "https://example.com",
+			AccessToken:     "access",
+			RefreshToken:    "refresh",
+			LocalAPIKeyHash: apiKeyHash,
+			MachineCode:     "machine",
+			UserID:          "user",
+		}},
+		Client: client,
+		Logger: logx.New(&strings.Builder{}, false),
+	}
 }
 
 func containsAny(s string, needles ...string) bool {

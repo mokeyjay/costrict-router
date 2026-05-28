@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"costrict-router/internal/compat"
 	"costrict-router/internal/config"
 	"costrict-router/internal/i18n"
 	"costrict-router/internal/ids"
@@ -32,6 +33,10 @@ type Handler struct {
 	DebugFullRequest bool
 }
 
+type requestTransformer func([]byte) ([]byte, bool, error)
+type responseTransformer func([]byte) ([]byte, error)
+type streamTransformer func(io.Reader) io.Reader
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
@@ -41,6 +46,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.forward(w, r, "/chat-rag/api/v1/chat/completions", true)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
+		if !h.authorizeLocalAPIKey(w, r) {
+			return
+		}
+		h.forwardCompat(w, r, "responses", compat.ConvertResponsesRequest, compat.ConvertChatCompletionToResponses, compat.TransformChatCompletionStreamToResponses)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
+		if !h.authorizeLocalAPIKey(w, r) {
+			return
+		}
+		h.forwardCompat(w, r, "messages", compat.ConvertAnthropicMessagesRequest, compat.ConvertChatCompletionToAnthropicMessage, compat.TransformChatCompletionStreamToAnthropic)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		if !h.authorizeLocalAPIKey(w, r) {
 			return
@@ -84,6 +99,117 @@ func (h *Handler) authorizeLocalAPIKey(w http.ResponseWriter, r *http.Request) b
 		return false
 	}
 	return true
+}
+
+func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, kind string, transformRequest requestTransformer, transformResponse responseTransformer, transformStream streamTransformer) {
+	start := time.Now()
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	chatBody, stream, err := transformRequest(bodyBytes)
+	if err != nil {
+		if apiErr := compat.AsAPIError(err); apiErr != nil {
+			writeOpenAIError(w, apiErr.Status, apiErr.Type, apiErr.Message)
+			return
+		}
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	if err := h.Tokens.EnsureFreshToken(r.Context()); err != nil {
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", err.Error())
+		return
+	}
+	cfg := h.Tokens.Config()
+	if !cfg.LoggedIn() {
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
+		return
+	}
+
+	upstreamURL, err := joinURL(cfg.BaseURL, "/chat-rag/api/v1/chat/completions")
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "configuration_error", err.Error())
+		return
+	}
+	if r.URL.RawQuery != "" {
+		upstreamURL += "?" + r.URL.RawQuery
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(chatBody))
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "proxy_error", err.Error())
+		return
+	}
+	copySelectedHeaders(req.Header, r.Header)
+	req.Header.Set("Content-Type", "application/json")
+	applyCostrictHeaders(req.Header, cfg, r)
+
+	requestID := req.Header.Get("X-Request-ID")
+	chatSummary := summarizeChatRequest(chatBody)
+	if h.Logger != nil && h.Logger.DebugEnabled() && h.DebugFullRequest {
+		h.Logger.Debugf("forward %s request id=%s method=%s path=%s upstream=%s headers=%v body=%q",
+			kind, requestID, r.Method, r.URL.Path, upstreamURL, logx.RedactHeader(req.Header), logx.TruncateBody(chatBody, 32*1024))
+	}
+
+	resp, err := h.httpClient().Do(req)
+	headersAt := time.Now()
+	if err != nil {
+		if h.Logger != nil {
+			h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
+		}
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	status := resp.StatusCode
+	outputFormat := responseFormat(resp.Header)
+	var responseBody io.Reader = resp.Body
+	if status >= 200 && status < 300 {
+		if stream && outputFormat == "sse" {
+			responseBody = transformStream(resp.Body)
+			copyTransformedResponseHeaders(w.Header(), resp.Header, "text/event-stream")
+			outputFormat = "sse"
+		} else {
+			upstreamBody, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", readErr.Error())
+				return
+			}
+			converted, convertErr := transformResponse(upstreamBody)
+			if convertErr != nil {
+				writeOpenAIError(w, http.StatusBadGateway, "proxy_error", convertErr.Error())
+				return
+			}
+			responseBody = bytes.NewReader(converted)
+			copyTransformedResponseHeaders(w.Header(), resp.Header, "application/json")
+			outputFormat = "json"
+		}
+	} else {
+		copyResponseHeaders(w.Header(), resp.Header)
+	}
+
+	var collector *responseMetricsCollector
+	if h.Logger != nil && h.Logger.DebugEnabled() {
+		collector = newResponseMetricsCollector(start, headersAt, outputFormat)
+		responseBody = collector.wrap(responseBody)
+	}
+	w.WriteHeader(status)
+	_, copyErr := copyAndFlush(w, responseBody)
+	if h.Logger != nil {
+		if h.Logger.DebugEnabled() {
+			if collector != nil {
+				h.logChatMetrics(requestID, r, status, start, chatSummary, collector.finish(), len(chatBody), copyErr)
+			}
+		} else if status >= 400 {
+			h.Logger.Warnf(i18n.T("upstream returned error method=%s path=%s status=%d request_id=%s duration=%s", "上游返回错误 method=%s path=%s status=%d request_id=%s duration=%s"),
+				r.Method, r.URL.Path, status, requestID, time.Since(start))
+		}
+	}
+	if copyErr != nil && h.Logger != nil {
+		h.Logger.Warnf(i18n.T("failed to copy upstream response request_id=%s err=%v", "复制上游响应失败 request_id=%s err=%v"), requestID, copyErr)
+	}
 }
 
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath string, isChatCompletion bool) {
@@ -248,6 +374,18 @@ func copyResponseHeaders(dst, src http.Header) {
 			dst.Add(key, value)
 		}
 	}
+}
+
+func copyTransformedResponseHeaders(dst, src http.Header, contentType string) {
+	for key, values := range src {
+		if isHopByHop(key) || strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Content-Type") {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+	dst.Set("Content-Type", contentType)
 }
 
 func isHopByHop(key string) bool {

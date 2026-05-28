@@ -529,7 +529,7 @@ func cmdKeyReset(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf(i18n.T("Local API Key reset. Save it now; it will not be shown again:\n%s\n", "本地 API Key 已重置。请立即保存，它不会再次显示：\n%s\n"), apiKey)
+	fmt.Printf(i18n.T("Local API Key reset. Save it now; it will not be shown again:\n🔑 %s\n", "本地 API Key 已重置。请立即保存，它不会再次显示：\n🔑 %s\n"), apiKey)
 	fmt.Printf(i18n.T("Config file: %s\n", "配置文件: %s\n"), path)
 	if pidPath, err := config.DefaultPIDPath(); err == nil {
 		if state, err := readDaemonState(pidPath); err == nil && state.ConfigPath == path {
@@ -615,7 +615,7 @@ func ensureLocalAPIKey(path string, cfg *config.Config, out io.Writer) (string, 
 		return "", err
 	}
 	if out != nil {
-		fmt.Fprintf(out, i18n.T("Local API Key generated. Save it now; it will not be shown again:\n%s\n", "已生成本地 API Key。请立即保存，它不会再次显示：\n%s\n"), apiKey)
+		fmt.Fprintf(out, i18n.T("Local API Key generated. Save it now; it will not be shown again:\n🔑 %s\n", "已生成本地 API Key。请立即保存，它不会再次显示：\n🔑 %s\n"), apiKey)
 	}
 	return apiKey, nil
 }
