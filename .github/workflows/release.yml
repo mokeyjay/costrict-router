@@ -166,6 +166,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v7
         with:
+          pattern: release-assets-*
           path: dist
           merge-multiple: true
 
