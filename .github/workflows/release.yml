@@ -184,6 +184,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Download artifacts
         uses: actions/download-artifact@v7
@@ -191,6 +193,34 @@ jobs:
           pattern: release-assets-*
           path: dist
           merge-multiple: true
+
+      - name: Build release notes
+        env:
+          VERSION: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # 按提交历史找到上一个 tag，用于生成从上个版本到本次的提交列表
+          prev_tag="$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || true)"
+
+          {
+            echo "## 更新内容"
+            echo
+            if [ -n "${prev_tag}" ]; then
+              git log --no-merges --pretty=format:'- %s (%h)' "${prev_tag}..${VERSION}"
+              echo
+              echo
+              echo "**完整变更**: https://github.com/${REPO}/compare/${prev_tag}...${VERSION}"
+            else
+              # 首个版本：列出该 tag 之前的全部提交
+              git log --no-merges --pretty=format:'- %s (%h)' "${VERSION}"
+            fi
+            echo
+          } > release_notes.md
+
+          echo "----- 生成的 release notes -----"
+          cat release_notes.md
 
       - name: Create or update GitHub Release
         env:
@@ -209,12 +239,12 @@ jobs:
           if gh release view "${VERSION}" >/dev/null 2>&1; then
             gh release edit "${VERSION}" \
               --title "${VERSION}" \
-              --notes "Release ${VERSION}" \
+              --notes-file release_notes.md \
               "${release_flags[@]}"
             gh release upload "${VERSION}" dist/* --clobber
           else
             gh release create "${VERSION}" dist/* \
               --title "${VERSION}" \
-              --notes "Release ${VERSION}" \
+              --notes-file release_notes.md \
               "${release_flags[@]}"
           fi
