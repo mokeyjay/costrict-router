@@ -66,13 +66,27 @@ func responsesInputToMessages(instructions, input json.RawMessage) ([]any, error
 		return nil, badRequest("Responses input 只支持字符串或数组")
 	}
 	var pendingToolCalls []any
+	pendingReasoning := ""
 	flushToolCalls := func() {
 		if len(pendingToolCalls) > 0 {
-			messages = append(messages, map[string]any{"role": "assistant", "tool_calls": pendingToolCalls})
+			assistant := map[string]any{"role": "assistant", "tool_calls": pendingToolCalls}
+			// 开了思考的上游（如 kimi）要求 assistant 工具调用消息携带非空 reasoning_content。
+			if pendingReasoning != "" {
+				assistant["reasoning_content"] = pendingReasoning
+			} else {
+				assistant["reasoning_content"] = toolCallReasoningPlaceholder
+			}
+			messages = append(messages, assistant)
 			pendingToolCalls = nil
+			pendingReasoning = ""
 		}
 	}
 	for _, item := range items {
+		if reasoning, ok := responseReasoningText(item); ok {
+			// reasoning 条目本身不进消息，但其文本会附到紧随的 assistant 工具调用上。
+			pendingReasoning = reasoning
+			continue
+		}
 		if call := responseFunctionCallToToolCall(item); call != nil {
 			// 相邻的 function_call 必须合并进同一条 assistant 消息，否则后续 tool 结果无法匹配，上游会拒绝。
 			pendingToolCalls = append(pendingToolCalls, call)
@@ -87,6 +101,21 @@ func responsesInputToMessages(instructions, input json.RawMessage) ([]any, error
 	}
 	flushToolCalls()
 	return messages, nil
+}
+
+func responseReasoningText(item any) (string, bool) {
+	m := getMap(item)
+	if m == nil || getString(m, "type") != "reasoning" {
+		return "", false
+	}
+	summary, _ := m["summary"].([]any)
+	var parts []string
+	for _, entry := range summary {
+		if text := getString(getMap(entry), "text"); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n"), true
 }
 
 func responseFunctionCallToToolCall(item any) map[string]any {
@@ -314,9 +343,13 @@ func ConvertChatCompletionToResponses(body []byte) ([]byte, error) {
 		"temperature":         nil,
 		"top_p":               nil,
 	}
-	if len(output) == 1 {
-		if text := responseOutputText(output[0]); text != "" {
+	for _, item := range output {
+		if getString(getMap(item), "type") != "message" {
+			continue
+		}
+		if text := responseOutputText(item); text != "" {
 			result["output_text"] = text
+			break
 		}
 	}
 	return json.Marshal(result)
@@ -330,6 +363,14 @@ func chatChoicesToResponsesOutput(raw json.RawMessage) []any {
 		message := getMap(choice["message"])
 		if message == nil {
 			continue
+		}
+		if reasoning := stringValue(message["reasoning_content"]); reasoning != "" {
+			output = append(output, map[string]any{
+				"id":      responseID("rs"),
+				"type":    "reasoning",
+				"status":  "completed",
+				"summary": []any{map[string]any{"type": "summary_text", "text": reasoning}},
+			})
 		}
 		if content := stringValue(message["content"]); content != "" {
 			output = append(output, map[string]any{

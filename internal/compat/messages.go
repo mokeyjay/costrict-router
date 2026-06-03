@@ -8,6 +8,9 @@ import (
 
 const maxOpenAIToolNameLength = 64
 
+// toolCallReasoningPlaceholder 用于在客户端未回传思考、但上游强制要求 assistant 工具调用消息携带 reasoning_content 时占位。
+const toolCallReasoningPlaceholder = " "
+
 func ConvertAnthropicMessagesRequest(body []byte) ([]byte, bool, error) {
 	payload, err := rawMap(body)
 	if err != nil {
@@ -16,6 +19,9 @@ func ConvertAnthropicMessagesRequest(body []byte) ([]byte, bool, error) {
 	chat := map[string]any{}
 	copyRawSame(chat, payload, "model", "temperature", "top_p", "metadata")
 	copyRaw(chat, payload, "max_tokens", "max_tokens")
+	if stops := rawAny(payload["stop_sequences"]); stops != nil {
+		chat["stop"] = stops
+	}
 	stream := rawBool(payload["stream"])
 	if stream {
 		chat["stream"] = true
@@ -139,12 +145,17 @@ func anthropicAssistantToChat(content any) map[string]any {
 		return map[string]any{"role": "assistant", "content": stringValue(content)}
 	}
 	var textParts []string
+	var thinkingParts []string
 	var toolCalls []any
 	for _, rawBlock := range blocks {
 		block := getMap(rawBlock)
 		switch getString(block, "type") {
 		case "text":
 			textParts = append(textParts, stringValue(block["text"]))
+		case "thinking":
+			if t := stringValue(block["thinking"]); t != "" {
+				thinkingParts = append(thinkingParts, t)
+			}
 		case "tool_use":
 			toolCalls = append(toolCalls, map[string]any{
 				"id":   stringValue(block["id"]),
@@ -159,6 +170,12 @@ func anthropicAssistantToChat(content any) map[string]any {
 	message := map[string]any{"role": "assistant", "content": strings.Join(textParts, "\n")}
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
+	}
+	// 回传 assistant 的思考；开了思考的上游（如 kimi）要求工具调用消息携带非空 reasoning_content。
+	if reasoning := strings.Join(thinkingParts, "\n"); reasoning != "" {
+		message["reasoning_content"] = reasoning
+	} else if len(toolCalls) > 0 {
+		message["reasoning_content"] = toolCallReasoningPlaceholder
 	}
 	return message
 }
@@ -182,17 +199,31 @@ func anthropicImageToChat(block map[string]any) any {
 	return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}
 }
 
-func anthropicToolResultContent(value any) string {
+func anthropicToolResultContent(value any) any {
 	switch content := value.(type) {
 	case string:
 		return content
 	case []any:
+		var parts []any
 		var texts []string
+		hasImage := false
 		for _, rawBlock := range content {
 			block := getMap(rawBlock)
-			if getString(block, "type") == "text" {
-				texts = append(texts, stringValue(block["text"]))
+			switch getString(block, "type") {
+			case "text":
+				text := stringValue(block["text"])
+				texts = append(texts, text)
+				parts = append(parts, map[string]any{"type": "text", "text": text})
+			case "image":
+				if part := anthropicImageToChat(block); part != nil {
+					parts = append(parts, part)
+					hasImage = true
+				}
 			}
+		}
+		// 上游 tool 角色消息支持数组内容，含图片时保留为多模态，否则压平成纯文本。
+		if hasImage {
+			return parts
 		}
 		if len(texts) > 0 {
 			return strings.Join(texts, "\n")
@@ -292,6 +323,9 @@ func ConvertChatCompletionToAnthropicMessage(body []byte) ([]byte, error) {
 		message := getMap(choice["message"])
 		if message == nil {
 			continue
+		}
+		if reasoning := stringValue(message["reasoning_content"]); reasoning != "" {
+			content = append(content, map[string]any{"type": "thinking", "thinking": reasoning, "signature": ""})
 		}
 		if text := stringValue(message["content"]); text != "" {
 			content = append(content, map[string]any{"type": "text", "text": text})

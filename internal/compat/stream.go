@@ -59,6 +59,10 @@ func writeResponsesStream(w io.Writer, upstream io.Reader, model string) error {
 	}
 
 	reader := bufio.NewReader(upstream)
+	reasoningItemID := responseID("rs")
+	reasoningStarted := false
+	reasoningIndex := 0
+	var reasoningBuf strings.Builder
 	textItemID := responseID("msg")
 	textStarted := false
 	textIndex := 0
@@ -92,6 +96,22 @@ func writeResponsesStream(w io.Writer, upstream io.Reader, model string) error {
 					delta := getMap(choice["delta"])
 					if delta == nil {
 						continue
+					}
+					if reasoning := stringValue(delta["reasoning_content"]); reasoning != "" {
+						if !reasoningStarted {
+							reasoningIndex = nextOutputIndex
+							nextOutputIndex++
+							item := map[string]any{"id": reasoningItemID, "type": "reasoning", "status": "in_progress", "summary": []any{}}
+							if err := emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": reasoningIndex, "item": item}); err != nil {
+								return err
+							}
+							_ = emit("response.reasoning_summary_part.added", map[string]any{"type": "response.reasoning_summary_part.added", "item_id": reasoningItemID, "output_index": reasoningIndex, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
+							reasoningStarted = true
+						}
+						reasoningBuf.WriteString(reasoning)
+						if err := emit("response.reasoning_summary_text.delta", map[string]any{"type": "response.reasoning_summary_text.delta", "item_id": reasoningItemID, "output_index": reasoningIndex, "summary_index": 0, "delta": reasoning}); err != nil {
+							return err
+						}
 					}
 					if content := stringValue(delta["content"]); content != "" {
 						if !textStarted {
@@ -153,6 +173,15 @@ func writeResponsesStream(w io.Writer, upstream io.Reader, model string) error {
 	}
 
 	finalOutput := make([]any, nextOutputIndex)
+	if reasoningStarted {
+		reasoning := reasoningBuf.String()
+		summary := []any{map[string]any{"type": "summary_text", "text": reasoning}}
+		_ = emit("response.reasoning_summary_text.done", map[string]any{"type": "response.reasoning_summary_text.done", "item_id": reasoningItemID, "output_index": reasoningIndex, "summary_index": 0, "text": reasoning})
+		_ = emit("response.reasoning_summary_part.done", map[string]any{"type": "response.reasoning_summary_part.done", "item_id": reasoningItemID, "output_index": reasoningIndex, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": reasoning}})
+		reasoningItem := map[string]any{"id": reasoningItemID, "type": "reasoning", "status": "completed", "summary": summary}
+		_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": reasoningIndex, "item": reasoningItem})
+		finalOutput[reasoningIndex] = reasoningItem
+	}
 	if textStarted {
 		text := textBuf.String()
 		_ = emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": textItemID, "output_index": textIndex, "content_index": 0, "text": text})
@@ -199,6 +228,29 @@ func writeAnthropicStream(w io.Writer, upstream io.Reader, model string) error {
 	currentToolIndex := -1
 	toolIDsByIndex := map[int]string{}
 	toolNamesByIndex := map[int]string{}
+
+	closeBlock := func() {
+		if !blockStarted {
+			return
+		}
+		if blockKind == "thinking" {
+			// thinking 块结束前补一个空 signature_delta，符合 Anthropic SDK 的累积流程。
+			_ = writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "signature_delta", "signature": ""}})
+		}
+		_ = writeSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
+		blockIndex++
+		blockStarted = false
+	}
+	startBlock := func(kind string, block map[string]any) error {
+		closeBlock()
+		if err := writeSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": block}); err != nil {
+			return err
+		}
+		blockStarted = true
+		blockKind = kind
+		return nil
+	}
+
 	for {
 		line, err := reader.ReadString('\n')
 		if len(line) > 0 {
@@ -225,17 +277,21 @@ func writeAnthropicStream(w io.Writer, upstream io.Reader, model string) error {
 					if delta == nil {
 						continue
 					}
-					if content := stringValue(delta["content"]); content != "" {
-						if !blockStarted || blockKind != "text" {
-							if blockStarted {
-								_ = writeSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
-								blockIndex++
-							}
-							if err := writeSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "text", "text": ""}}); err != nil {
+					if reasoning := stringValue(delta["reasoning_content"]); reasoning != "" {
+						if !blockStarted || blockKind != "thinking" {
+							if err := startBlock("thinking", map[string]any{"type": "thinking", "thinking": "", "signature": ""}); err != nil {
 								return err
 							}
-							blockStarted = true
-							blockKind = "text"
+						}
+						if err := writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": reasoning}}); err != nil {
+							return err
+						}
+					}
+					if content := stringValue(delta["content"]); content != "" {
+						if !blockStarted || blockKind != "text" {
+							if err := startBlock("text", map[string]any{"type": "text", "text": ""}); err != nil {
+								return err
+							}
 						}
 						if err := writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "text_delta", "text": content}}); err != nil {
 							return err
@@ -252,16 +308,10 @@ func writeAnthropicStream(w io.Writer, upstream io.Reader, model string) error {
 								toolNamesByIndex[callIndex] = name
 							}
 							if !blockStarted || blockKind != "tool_use" || currentToolIndex != callIndex {
-								if blockStarted {
-									_ = writeSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
-									blockIndex++
-								}
 								block := map[string]any{"type": "tool_use", "id": callID, "name": toolNamesByIndex[callIndex], "input": map[string]any{}}
-								if err := writeSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": block}); err != nil {
+								if err := startBlock("tool_use", block); err != nil {
 									return err
 								}
-								blockStarted = true
-								blockKind = "tool_use"
 								currentToolIndex = callIndex
 							}
 							if args := stringValue(fn["arguments"]); args != "" {
@@ -281,9 +331,7 @@ func writeAnthropicStream(w io.Writer, upstream io.Reader, model string) error {
 			return err
 		}
 	}
-	if blockStarted {
-		_ = writeSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
-	}
+	closeBlock()
 	_ = writeSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": usage})
 	return writeSSE(w, "message_stop", map[string]any{"type": "message_stop"})
 }

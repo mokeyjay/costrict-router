@@ -53,6 +53,56 @@ func TestConvertResponsesRequestRejectsStateOnlyPreviousResponse(t *testing.T) {
 	}
 }
 
+func TestConvertResponsesRequestMergesParallelToolCallsAndSkipsReasoning(t *testing.T) {
+	body := []byte(`{"model":"m","input":[
+		{"type":"message","role":"user","content":"go"},
+		{"type":"reasoning","id":"rs_1","summary":[]},
+		{"type":"function_call","call_id":"c1","name":"a","arguments":"{}"},
+		{"type":"function_call","call_id":"c2","name":"b","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":"r1"},
+		{"type":"function_call_output","call_id":"c2","output":"r2"}
+	]}`)
+	converted, _, err := ConvertResponsesRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(converted, &chat); err != nil {
+		t.Fatal(err)
+	}
+	messages := chat["messages"].([]any)
+	// user, assistant(2 tool_calls), tool(c1), tool(c2) —— reasoning 被跳过，并行 function_call 合并
+	if len(messages) != 4 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	assistant := messages[1].(map[string]any)
+	if assistant["role"] != "assistant" || len(assistant["tool_calls"].([]any)) != 2 {
+		t.Fatalf("assistant tool_calls not merged: %#v", assistant)
+	}
+	if messages[2].(map[string]any)["role"] != "tool" || messages[3].(map[string]any)["role"] != "tool" {
+		t.Fatalf("tool results = %#v", messages)
+	}
+}
+
+func TestConvertChatCompletionToResponsesIncludesReasoning(t *testing.T) {
+	body := []byte(`{"model":"m","choices":[{"finish_reason":"stop","message":{"role":"assistant","reasoning_content":"thinking","content":"hi"}}]}`)
+	converted, err := ConvertChatCompletionToResponses(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(converted, &response); err != nil {
+		t.Fatal(err)
+	}
+	output := response["output"].([]any)
+	if output[0].(map[string]any)["type"] != "reasoning" || output[1].(map[string]any)["type"] != "message" {
+		t.Fatalf("output = %#v", output)
+	}
+	if response["output_text"] != "hi" {
+		t.Fatalf("output_text = %#v", response["output_text"])
+	}
+}
+
 func TestConvertChatCompletionToResponses(t *testing.T) {
 	body := []byte(`{
 		"id":"chatcmpl_1",

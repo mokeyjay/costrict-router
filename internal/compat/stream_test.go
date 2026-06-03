@@ -38,6 +38,32 @@ func TestTransformChatCompletionStreamToAnthropic(t *testing.T) {
 	}
 }
 
+func TestTransformStreamSurfacesReasoning(t *testing.T) {
+	upstream := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	resp, err := io.ReadAll(TransformChatCompletionStreamToResponses(strings.NewReader(upstream), "m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"event: response.reasoning_summary_text.delta", `"type":"reasoning"`} {
+		if !strings.Contains(string(resp), want) {
+			t.Fatalf("responses stream missing %q:\n%s", want, resp)
+		}
+	}
+
+	anth, err := io.ReadAll(TransformChatCompletionStreamToAnthropic(strings.NewReader(upstream), "m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"type":"thinking"`, `"type":"thinking_delta"`, `"type":"signature_delta"`} {
+		if !strings.Contains(string(anth), want) {
+			t.Fatalf("anthropic stream missing %q:\n%s", want, anth)
+		}
+	}
+}
+
 func TestTransformStreamKeepsToolCallIndexAcrossChunks(t *testing.T) {
 	upstream := strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\"\"}}]}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"x\\\"}\"}}]}}]}\n\n" +

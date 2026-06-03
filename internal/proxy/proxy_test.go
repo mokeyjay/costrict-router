@@ -154,6 +154,50 @@ func TestResponsesRejectsPreviousResponseWithoutInput(t *testing.T) {
 	}
 }
 
+func TestForwardCompatConvertsUpstreamErrorFormat(t *testing.T) {
+	apiKey, apiKeyHash := localAPIKeyForTest(t)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"slow down","type":"ai_model_error"}}`)),
+		}, nil
+	})}
+	handler := testHandler(apiKeyHash, client)
+
+	// messages 端点应返回 Anthropic 错误信封
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-api-key", apiKey)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var anthropicErr map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &anthropicErr); err != nil {
+		t.Fatal(err)
+	}
+	if anthropicErr["type"] != "error" {
+		t.Fatalf("messages error not anthropic-shaped: %s", rec.Body.String())
+	}
+	if anthropicErr["error"].(map[string]any)["type"] != "rate_limit_error" {
+		t.Fatalf("messages error type = %s", rec.Body.String())
+	}
+
+	// responses 端点应返回 OpenAI 错误信封
+	req = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var openaiErr map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &openaiErr); err != nil {
+		t.Fatal(err)
+	}
+	if openaiErr["error"].(map[string]any)["type"] != "rate_limit_error" {
+		t.Fatalf("responses error = %s", rec.Body.String())
+	}
+}
+
 func TestForwardRequiresLocalAPIKey(t *testing.T) {
 	// 本地 /v1 入口必须先校验本地 API Key，失败时不能触达上游。
 	apiKey, apiKeyHash := localAPIKeyForTest(t)

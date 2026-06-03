@@ -80,10 +80,12 @@ costrict-router start
 
 ## 🔌 本地接口
 
-所有 `/v1/*` 接口都需要使用本地 API Key：
+所有 `/v1/*` 接口都需要使用本地 API Key，两种鉴权头都支持（OpenAI 风格用 `Authorization`，Anthropic 风格用 `x-api-key`）：
 
 ```http
 Authorization: Bearer sk-costrict-...
+# 或
+x-api-key: sk-costrict-...
 ```
 
 | 方法 | 路径 | 说明 |
@@ -94,7 +96,7 @@ Authorization: Bearer sk-costrict-...
 | `GET` | `/v1/models` | 查看当前账号可用模型 |
 | `GET` | `/healthz` | 本地服务健康检查 |
 
-`/v1/responses` 与 `/v1/messages` 是尽力兼容层，适合文本、图片输入、工具调用和基础流式输出。当前版本不持久化 Responses 状态，因此不支持依赖历史状态的 `previous_response_id`。
+`/v1/responses` 与 `/v1/messages` 是本地转换出来的兼容入口，日常的对话、图片、工具调用、流式输出都能正常使用。少数高级特性受上游能力限制，详见[高级用法 - 兼容性与已知限制](./docs/advanced-usage.md#兼容性与已知限制)。
 
 ## 📚 查看模型
 

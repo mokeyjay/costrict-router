@@ -128,7 +128,7 @@ func RedactHeader(h http.Header) http.Header {
 	out := make(http.Header, len(h))
 	for key, values := range h {
 		lower := strings.ToLower(key)
-		if lower == "authorization" || strings.Contains(lower, "token") {
+		if lower == "authorization" || lower == "x-api-key" || lower == "api-key" || strings.Contains(lower, "token") {
 			out[key] = []string{"***"}
 			continue
 		}
