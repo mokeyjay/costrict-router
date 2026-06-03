@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 func ConvertResponsesRequest(body []byte) ([]byte, bool, error) {
@@ -64,14 +65,43 @@ func responsesInputToMessages(instructions, input json.RawMessage) ([]any, error
 	if err := json.Unmarshal(input, &items); err != nil {
 		return nil, badRequest("Responses input 只支持字符串或数组")
 	}
+	var pendingToolCalls []any
+	flushToolCalls := func() {
+		if len(pendingToolCalls) > 0 {
+			messages = append(messages, map[string]any{"role": "assistant", "tool_calls": pendingToolCalls})
+			pendingToolCalls = nil
+		}
+	}
 	for _, item := range items {
+		if call := responseFunctionCallToToolCall(item); call != nil {
+			// 相邻的 function_call 必须合并进同一条 assistant 消息，否则后续 tool 结果无法匹配，上游会拒绝。
+			pendingToolCalls = append(pendingToolCalls, call)
+			continue
+		}
+		flushToolCalls()
 		converted, err := responseInputItemToChatMessages(item)
 		if err != nil {
 			return nil, err
 		}
 		messages = append(messages, converted...)
 	}
+	flushToolCalls()
 	return messages, nil
+}
+
+func responseFunctionCallToToolCall(item any) map[string]any {
+	m := getMap(item)
+	if m == nil || getString(m, "type") != "function_call" {
+		return nil
+	}
+	return map[string]any{
+		"id":   firstNonEmpty(getString(m, "call_id"), getString(m, "id")),
+		"type": "function",
+		"function": map[string]any{
+			"name":      getString(m, "name"),
+			"arguments": stringValue(m["arguments"]),
+		},
+	}
 }
 
 func responseInputItemToChatMessages(item any) ([]any, error) {
@@ -114,7 +144,8 @@ func responseInputItemToChatMessages(item any) ([]any, error) {
 		if content != nil {
 			return []any{map[string]any{"role": "user", "content": []any{content}}}, nil
 		}
-		return nil, badRequest(fmt.Sprintf("不支持的 Responses input 类型: %s", itemType))
+		// 未知条目（如 reasoning）直接跳过，避免编程 agent 回传完整 output 时报错。
+		return nil, nil
 	}
 }
 
@@ -266,13 +297,22 @@ func ConvertChatCompletionToResponses(body []byte) ([]byte, error) {
 		status = "incomplete"
 	}
 	result := map[string]any{
-		"id":      respID,
-		"object":  "response",
-		"created": timeFromChatCreated(chat["created"]),
-		"model":   rawString(chat["model"]),
-		"status":  status,
-		"output":  output,
-		"usage":   chatUsageToResponses(chat["usage"]),
+		"id":                  respID,
+		"object":              "response",
+		"created_at":          timeFromChatCreated(chat["created"]),
+		"model":               rawString(chat["model"]),
+		"status":              status,
+		"output":              output,
+		"usage":               chatUsageToResponses(chat["usage"]),
+		"parallel_tool_calls": true,
+		"tool_choice":         "auto",
+		"tools":               []any{},
+		"error":               nil,
+		"incomplete_details":  nil,
+		"instructions":        nil,
+		"metadata":            map[string]any{},
+		"temperature":         nil,
+		"top_p":               nil,
 	}
 	if len(output) == 1 {
 		if text := responseOutputText(output[0]); text != "" {
@@ -364,7 +404,7 @@ func timeFromChatCreated(raw json.RawMessage) int64 {
 	if err := json.Unmarshal(raw, &value); err == nil && value > 0 {
 		return value
 	}
-	return 0
+	return time.Now().Unix()
 }
 
 func stringValue(value any) string {

@@ -35,7 +35,7 @@ type Handler struct {
 
 type requestTransformer func([]byte) ([]byte, bool, error)
 type responseTransformer func([]byte) ([]byte, error)
-type streamTransformer func(io.Reader) io.Reader
+type streamTransformer func(io.Reader, string) io.Reader
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
@@ -91,6 +91,10 @@ func (h *Handler) authorizeLocalAPIKey(w http.ResponseWriter, r *http.Request) b
 	}
 	apiKey, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok || apiKey == "" {
+		// Anthropic 风格客户端用 x-api-key 鉴权，OpenAI 风格用 Authorization: Bearer，两者都接受。
+		apiKey = strings.TrimSpace(r.Header.Get("x-api-key"))
+	}
+	if apiKey == "" {
 		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("missing local API key", "缺少本地 API Key"))
 		return false
 	}
@@ -168,7 +172,7 @@ func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, kind str
 	var responseBody io.Reader = resp.Body
 	if status >= 200 && status < 300 {
 		if stream && outputFormat == "sse" {
-			responseBody = transformStream(resp.Body)
+			responseBody = transformStream(resp.Body, modelName(chatBody))
 			copyTransformedResponseHeaders(w.Header(), resp.Header, "text/event-stream")
 			outputFormat = "sse"
 		} else {
@@ -431,6 +435,14 @@ func (h *Handler) httpClient() *http.Client {
 		return h.Client
 	}
 	return http.DefaultClient
+}
+
+func modelName(body []byte) string {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	return payload.Model
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, typ, message string) {

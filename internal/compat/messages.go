@@ -27,8 +27,8 @@ func ConvertAnthropicMessagesRequest(body []byte) ([]byte, bool, error) {
 	if choice := convertAnthropicToolChoice(payload["tool_choice"]); choice != nil {
 		chat["tool_choice"] = choice
 	}
-	if thinking := rawAny(payload["thinking"]); thinking != nil {
-		chat["metadata"] = mergeMetadata(chat["metadata"], "anthropic_thinking", thinking)
+	if effort := anthropicThinkingToEffort(payload["thinking"]); effort != "" {
+		chat["reasoning_effort"] = effort
 	}
 	if responseFormat := rawAny(payload["output_format"]); responseFormat != nil {
 		chat["response_format"] = responseFormat
@@ -140,7 +140,6 @@ func anthropicAssistantToChat(content any) map[string]any {
 	}
 	var textParts []string
 	var toolCalls []any
-	var thinking []any
 	for _, rawBlock := range blocks {
 		block := getMap(rawBlock)
 		switch getString(block, "type") {
@@ -155,16 +154,11 @@ func anthropicAssistantToChat(content any) map[string]any {
 					"arguments": stringValue(block["input"]),
 				},
 			})
-		case "thinking", "redacted_thinking":
-			thinking = append(thinking, block)
 		}
 	}
 	message := map[string]any{"role": "assistant", "content": strings.Join(textParts, "\n")}
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
-	}
-	if len(thinking) > 0 {
-		message["thinking_blocks"] = thinking
 	}
 	return message
 }
@@ -240,6 +234,8 @@ func convertAnthropicToolChoice(raw json.RawMessage) any {
 	switch getString(choice, "type") {
 	case "auto":
 		return "auto"
+	case "none":
+		return "none"
 	case "any":
 		return "required"
 	case "tool":
@@ -252,15 +248,26 @@ func convertAnthropicToolChoice(raw json.RawMessage) any {
 	}
 }
 
-func mergeMetadata(existing any, key string, value any) map[string]any {
-	metadata := map[string]any{}
-	if m := getMap(existing); m != nil {
-		for k, v := range m {
-			metadata[k] = v
-		}
+func anthropicThinkingToEffort(raw json.RawMessage) string {
+	// Anthropic thinking 没有 OpenAI 对应字段，按 budget_tokens 粗略映射到 reasoning_effort。
+	var thinking map[string]any
+	if err := json.Unmarshal(raw, &thinking); err != nil {
+		return ""
 	}
-	metadata[key] = value
-	return metadata
+	if getString(thinking, "type") != "enabled" {
+		return ""
+	}
+	budget := intFromMap(thinking, "budget_tokens")
+	switch {
+	case budget <= 0:
+		return "medium"
+	case budget < 4096:
+		return "low"
+	case budget < 16384:
+		return "medium"
+	default:
+		return "high"
+	}
 }
 
 func truncateToolName(name string) string {

@@ -67,19 +67,14 @@ costrict-router login --base-url https://www.abc.com
 costrict-router start
 ```
 
-首次启动会生成本地 API Key。请立即保存终端中输出的 `sk-costrict-...`，它只会显示一次。
+⚠️ 首次启动会生成本地 API Key，请保存终端中输出的 `sk-costrict-...`，它只会显示一次。
 
-默认本地地址：
-
-```text
-http://127.0.0.1:14567/v1
-```
 
 ### 3. 配置 Agent 工具
 
 | 配置项 | 值 |
 | --- | --- |
-| Base URL | `http://127.0.0.1:14567/v1` |
+| Base URL | `http://127.0.0.1:14567/v1`（默认） |
 | API Key | 初次启动时输出的 `sk-costrict-...` |
 | Model | 使用 `costrict-router models` 查看 |
 
