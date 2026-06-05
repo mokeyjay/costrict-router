@@ -137,7 +137,7 @@ func cmdLogin(args []string) error {
 			return err
 		}
 		fmt.Printf(i18n.T("Token imported, config file: %s\n", "已导入 token，配置文件: %s\n"), path)
-		fmt.Printf("base_url: %s\nuser_id: %s\naccess_token: %s\n", cfg.BaseURL, cfg.UserID, config.Redact(cfg.AccessToken))
+		fmt.Printf("base_url: %s\nuser_id: %s\naccess_token: %s\n", cfg.BaseURL, config.Redact(cfg.UserID), config.Redact(cfg.AccessToken))
 		return nil
 	}
 
@@ -181,7 +181,7 @@ func cmdLogin(args []string) error {
 	if err := cfg.Save(path); err != nil {
 		return err
 	}
-	fmt.Printf(i18n.T("Login succeeded, config file: %s\nuser_id: %s\naccess_token: %s\n", "登录成功，配置文件: %s\nuser_id: %s\naccess_token: %s\n"), path, cfg.UserID, config.Redact(cfg.AccessToken))
+	fmt.Printf(i18n.T("Login succeeded, config file: %s\nuser_id: %s\naccess_token: %s\n", "登录成功，配置文件: %s\nuser_id: %s\naccess_token: %s\n"), path, config.Redact(cfg.UserID), config.Redact(cfg.AccessToken))
 	return nil
 }
 

@@ -73,7 +73,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter) {
 		"base_url":                 cfg.BaseURL,
 		"listen_addr":              cfg.ListenAddr,
 		"machine_code":             config.Redact(cfg.MachineCode),
-		"user_id":                  cfg.UserID,
+		"user_id":                  config.Redact(cfg.UserID),
 		"access_token":             config.Redact(cfg.AccessToken),
 		"refresh_token":            config.Redact(cfg.RefreshToken),
 		"access_expires":           cfg.AccessTokenExpiresAt,

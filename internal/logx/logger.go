@@ -127,14 +127,23 @@ func (l *Logger) logf(level, emoji, color, format string, args ...any) {
 func RedactHeader(h http.Header) http.Header {
 	out := make(http.Header, len(h))
 	for key, values := range h {
-		lower := strings.ToLower(key)
-		if lower == "authorization" || lower == "x-api-key" || lower == "api-key" || strings.Contains(lower, "token") {
+		if sensitiveHeader(key) {
 			out[key] = []string{"***"}
 			continue
 		}
 		out[key] = append([]string(nil), values...)
 	}
 	return out
+}
+
+func sensitiveHeader(key string) bool {
+	switch lower := strings.ToLower(key); lower {
+	// 鉴权与身份类请求头：access token、本地 API Key、用户 ID、机器码等。
+	case "authorization", "x-api-key", "api-key", "x-user-id", "zgsm-client-id":
+		return true
+	default:
+		return strings.Contains(lower, "token")
+	}
 }
 
 func StripANSI(s string) string {

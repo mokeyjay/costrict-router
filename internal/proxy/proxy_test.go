@@ -412,6 +412,7 @@ func TestHealthzRedactsTokens(t *testing.T) {
 			RefreshToken:          "refreshabcdefghijklmnopqrstuvwxyz",
 			LocalAPIKeyHash:       "v1:sha256:salt:digest",
 			MachineCode:           "machineabcdefghijklmnopqrstuvwxyz",
+			UserID:                "useridabcdefghijklmnopqrstuvwxyz",
 			AccessTokenExpiresAt:  time.Unix(1893456000, 0),
 			RefreshTokenExpiresAt: time.Unix(1893456000, 0),
 		}},
