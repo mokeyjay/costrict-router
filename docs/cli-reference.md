@@ -58,7 +58,7 @@
 
 ### `codex-catalog`
 
-拉取上游可用模型，生成 codex 的模型目录文件 `~/.codex/costrict-router-model-catalog.json`，并把 codex 的 `config.toml` 顶层 `model_catalog_json` 指向它。用法详见 [高级用法 - 配合 codex 使用](./advanced-usage.md#配合-codex-使用)。
+拉取上游可用模型，生成 codex 的模型目录文件 `~/.codex/costrict-router-model-catalog.json`，并把 codex 的 `config.toml` 顶层 `model_catalog_json` 指向它。用法详见 [在 codex 中使用](./codex.md)。
 
 | 参数 | 说明 |
 | --- | --- |

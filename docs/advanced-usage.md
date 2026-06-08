@@ -2,6 +2,7 @@
 
 本页是常见使用场景的合集。参考类文档已拆分到下面几篇：
 
+- [在 codex 中使用](./codex.md) —— 接入 codex、让模型进 `/model` 选择器
 - [部署与构建](./deployment.md) —— 自行编译、Docker 镜像部署
 - [命令参考](./cli-reference.md) —— 全部命令、参数与日志调试
 - [配置与文件位置](./configuration.md) —— 配置文件、日志/PID 路径、环境变量
@@ -28,32 +29,6 @@ costrict-router restart
 ```
 
 如果旧 key 已遗失，只能重置生成新的 key；旧 key 会立即失效，正在运行的后台服务需要重启后才会加载新 key。
-
-## 配合 codex 使用
-
-使用 codex 时通常需要额外处理两件事。
-
-**1. 让 CoStrict 模型出现在 `/model` 选择器**
-
-codex 只有在 provider 使用 command 方式鉴权（或使用 codex 官方后端）时才会去拉取模型列表，普通 API Key 方式不会拉取，所以 codex 的 `/model` 选择器默认只显示它自带的 gpt 系列，看不到 CoStrict 模型。执行：
-
-```bash
-costrict-router codex-catalog
-```
-
-它会拉取当前账号可用模型，生成 `~/.codex/costrict-router-model-catalog.json`，并把 codex `~/.codex/config.toml` 顶层的 `model_catalog_json` 指向该文件（首次改动会保留一份 `config.toml.bak` 备份）。codex 配置该项后会改用本地静态目录、不再依赖网络拉取，`/model` 选择器即可看到这些模型。
-
-几点注意：
-
-- 这是**静态快照**：上游模型增减后需要重新执行本命令刷新。
-- 配置后 codex `/model` **只会显示这些模型**，其自带的 gpt 系列会被替换掉。
-- 改动在**下次启动 codex（或新开会话）** 时生效。
-- 不想让命令自动改 `config.toml` 的话，加 `--no-config`，它只生成目录文件并打印出需要手动添加的配置行。
-- codex 主目录不在默认位置时，用 `--codex-home` 指定（或设置 `CODEX_HOME` 环境变量）。
-
-**2. 让 multi-agent 等辅助功能可用**
-
-见下方[手动指定兜底模型](#手动指定兜底模型)。
 
 ## 手动指定兜底模型
 
