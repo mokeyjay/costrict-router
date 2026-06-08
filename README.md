@@ -45,7 +45,7 @@ _单文件 • 跨平台 • 自动续期 • 多格式兼容_
 
 ### Docker 部署
 
-见 [高级用法](./docs/advanced-usage.md)
+见 [部署与构建](./docs/deployment.md)
 
 ## 🚀 快速开始
 
@@ -78,6 +78,8 @@ costrict-router start
 | API Key | 初次启动时输出的 `sk-costrict-...` |
 | Model | 使用 `costrict-router models` 查看 |
 
+> 💡 **使用 codex 时有两点注意**：codex 的 `/model` 选择器默认看不到 CoStrict 模型，而且 multi-agent 等辅助功能会用上游不存在的模型名。详见[高级用法 - 配合 codex 使用](./docs/advanced-usage.md#配合-codex-使用)。
+
 ## 🔌 本地接口
 
 所有 `/v1/*` 接口都需要使用本地 API Key，两种鉴权头都支持（OpenAI 风格用 `Authorization`，Anthropic 风格用 `x-api-key`）：
@@ -96,7 +98,7 @@ x-api-key: sk-costrict-...
 | `GET` | `/v1/models` | 查看当前账号可用模型 |
 | `GET` | `/healthz` | 本地服务健康检查 |
 
-`/v1/responses` 与 `/v1/messages` 是本地转换出来的兼容入口，日常的对话、图片、工具调用、流式输出都能正常使用。少数高级特性受上游能力限制，详见[高级用法 - 兼容性与已知限制](./docs/advanced-usage.md#兼容性与已知限制)。
+`/v1/responses` 与 `/v1/messages` 是本地转换出来的兼容入口，日常的对话、图片、工具调用、流式输出都能正常使用。少数高级特性受上游能力限制，详见[兼容性与已知限制](./docs/compatibility.md)。
 
 ## 📚 查看模型
 
@@ -124,4 +126,8 @@ kimi-k2.5    256000   32000       true   false
 
 ## 🧰 高级用法
 
-完整命令参数、日志调试、配置文件位置、环境变量和常见进阶场景见 [高级用法](./docs/advanced-usage.md)。
+- [高级用法](./docs/advanced-usage.md) —— 常见使用场景（换端口、配合 codex、手动指定兜底模型等）
+- [命令参考](./docs/cli-reference.md) —— 全部命令、参数与日志调试
+- [配置与文件位置](./docs/configuration.md) —— 配置文件、日志/PID 路径、环境变量
+- [部署与构建](./docs/deployment.md) —— 自行编译、Docker 镜像部署
+- [兼容性与已知限制](./docs/compatibility.md) —— Responses / Messages 转换的注意事项

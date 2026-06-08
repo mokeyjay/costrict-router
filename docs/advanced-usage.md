@@ -1,200 +1,13 @@
 # 高级用法
 
-## 自行构建
+本页是常见使用场景的合集。参考类文档已拆分到下面几篇：
 
-```bash
-git clone https://github.com/mokeyjay/costrict-router.git
-cd costrict-router
-go build -o costrict-router ./cmd/costrict-router
-```
+- [部署与构建](./deployment.md) —— 自行编译、Docker 镜像部署
+- [命令参考](./cli-reference.md) —— 全部命令、参数与日志调试
+- [配置与文件位置](./configuration.md) —— 配置文件、日志/PID 路径、环境变量
+- [兼容性与已知限制](./compatibility.md) —— Responses / Messages 转换的注意事项
 
-## Docker 镜像
-
-容器默认使用 `/data/config.json` 保存登录态和本地 API Key。可以先创建一个 volume：
-
-```bash
-docker volume create costrict-router-data
-```
-
-### 1. 首次登录 CoStrict
-
-```bash
-docker run --rm -it \
-  -v costrict-router-data:/data \
-  ghcr.io/mokeyjay/costrict-router:latest \
-  login --base-url https://www.abc.com
-```
-
-### 2. 生成本地 API Key：
-
-```bash
-docker run --rm -it \
-  -v costrict-router-data:/data \
-  ghcr.io/mokeyjay/costrict-router:latest \
-  key reset
-```
-
-`key reset` 输出的 `sk-costrict-...` 只会显示一次，请立即保存。
-
-### 3. 启动代理服务：
-
-```bash
-docker run -d --name costrict-router \
-  -p 14567:14567 \
-  -v costrict-router-data:/data \
-  ghcr.io/mokeyjay/costrict-router:latest
-```
-
-之后就能愉快使用 `http://[宿主机 ip]:14567/v1` 啦～
-
-## 命令一览
-
-| 命令 | 作用 | 示例 |
-| --- | --- | --- |
-| `login` | 登录并保存 CoStrict token | `costrict-router login --base-url https://www.abc.com` |
-| `serve` | 前台启动本地代理 | `costrict-router serve --debug` |
-| `start` | 后台启动本地代理 | `costrict-router start` |
-| `stop` | 停止后台服务 | `costrict-router stop` |
-| `status` | 查看后台服务状态 | `costrict-router status` |
-| `restart` | 重启后台服务 | `costrict-router restart` |
-| `logs` | 监看日志 | `costrict-router logs` |
-| `models` | 查看可用模型 | `costrict-router models` |
-| `fallback` | 设置未知模型的兜底模型 | `costrict-router fallback` |
-| `key reset` | 重置本地 API Key | `costrict-router key reset` |
-
-## 命令参数
-
-### `login`
-
-| 参数 | 说明 |
-| --- | --- |
-| `--base-url` | CoStrict 服务端地址 |
-| `--url` | CoStrict 插件生成的登录 URL |
-| `--config` | 指定配置文件路径 |
-| `--timeout` | 登录轮询超时时间，默认 `5m` |
-
-### `serve`
-
-| 参数 | 说明 |
-| --- | --- |
-| `--addr` | 本地监听地址，默认 `127.0.0.1:14567` |
-| `--config` | 指定配置文件路径 |
-| `--debug` | 输出对话指标摘要 |
-| `--debug-full-request` | 输出脱敏后的请求头和截断请求体 |
-| `--log-file` | 指定日志文件 |
-
-### `start`
-
-| 参数 | 说明 |
-| --- | --- |
-| `--addr` | 本地监听地址 |
-| `--config` | 指定配置文件路径 |
-| `--debug` | 后台服务开启对话指标日志 |
-| `--debug-full-request` | 后台服务输出脱敏后的请求头和截断请求体 |
-| `--log-file` | 指定日志文件 |
-| `--pid-file` | 指定 PID 文件 |
-
-### `logs`
-
-| 参数 | 说明 |
-| --- | --- |
-| `-n` | 开始跟随前先显示最近 N 行 |
-| `--plain` | 去除 ANSI 高亮 |
-| `--log-file` | 指定日志文件 |
-
-### `key reset`
-
-重置本地 API Key。新 key 只会在命令输出中显示一次，配置文件中只保存 hash。
-
-| 参数 | 说明 |
-| --- | --- |
-| `--config` | 指定配置文件路径 |
-
-## 日志调试
-
-滚动查看日志：
-
-```bash
-costrict-router logs
-```
-
-或前台调试：
-
-```bash
-costrict-router serve --debug
-```
-
-默认日志只记录程序流程和状态变化，例如启动、停止、刷新 token、上游错误摘要。`--debug` 会记录每次对话请求的指标摘要，例如模型、是否流式、状态码、首字节耗时、总耗时、请求/响应字节数和 token usage，不会打印完整 prompt。
-
-如需排查真实请求内容，可以额外开启：
-
-```bash
-costrict-router serve --debug-full-request
-```
-
-`--debug-full-request` 会记录脱敏后的转发请求头和截断后的请求体，适合临时排查协议问题，不建议长期后台开启。
-
-## 兼容性与已知限制
-
-`/v1/responses` 和 `/v1/messages` 是在本地把请求翻译成上游能识别的格式再转发的。日常使用（多轮对话、图片、工具调用、流式输出）都没问题，但下面几种情况可能和官方 API 的体验不一致，使用前留个意：
-
-- **提示词缓存不会生效**：上游不支持缓存，客户端带的缓存标记会被忽略。请求本身正常，只是每次都按完整内容计费、首字延迟也不会因缓存而变快。
-
-- **靠"停止词"判断分支会失灵**：你可以正常用停止序列让模型在指定位置停下，但上游不会告诉我们究竟命中了哪个词，因此返回里的结束原因始终是"正常结束"。如果你的程序依赖"模型是因为停止词才停下"这个状态，会拿不到。
-
-- **不能只靠 `previous_response_id` 续聊**：本工具不在本地保存历史对话，每次都要把完整上下文发上来。只传一个 `previous_response_id` 而不带完整内容的请求会被拒绝。
-
-- **部分内置能力用不了**：联网搜索、文件检索、Computer Use 这类依赖上游专门支持的功能都不可用，只有你自己定义的函数工具能正常调用。请求里带了这些内置工具时它们会被静默忽略，不会报错。
-
-- **图片要挑模型**：只有支持视觉的模型才能识别图片（用 `costrict-router models` 看 `IMAGE` 列）。给不支持的模型发图片可能被忽略或报错。
-
-- **思考力度控制不精确**：模型自带思考过程并会原样透传，但你无法精确指定思考预算，相关参数只能粗略生效甚至被忽略。
-
-## 文件位置
-
-### 配置文件
-
-默认配置文件：
-
-```text
-<os.UserConfigDir>/costrict-router/config.json
-```
-
-常见系统路径：
-
-| 系统 | 路径 |
-| --- | --- |
-| macOS | `~/Library/Application Support/costrict-router/config.json` |
-| Linux | `~/.config/costrict-router/config.json` |
-| Windows | `%AppData%\costrict-router\config.json` |
-
-### 日志与 PID
-
-默认后台文件：
-
-```text
-日志: <os.UserCacheDir>/costrict-router/costrict-router.log
-PID:  <os.UserCacheDir>/costrict-router/costrict-router.pid
-```
-
-常见系统目录：
-
-| 系统 | 目录 |
-| --- | --- |
-| macOS | `~/Library/Caches/costrict-router/` |
-| Linux | `~/.cache/costrict-router/` |
-| Windows | `%LocalAppData%\costrict-router\` |
-
-## 环境变量
-
-| 环境变量 | 说明 | 示例 |
-| --- | --- | --- |
-| `COSTRICT_ROUTER_CONFIG` | 指定配置文件路径 | `COSTRICT_ROUTER_CONFIG=/tmp/cr.json costrict-router status` |
-| `COSTRICT_ROUTER_LANG` | 指定语言，支持 `zh` / `en` | `COSTRICT_ROUTER_LANG=zh costrict-router status` |
-
-## 常见用法
-
-### 换一个端口启动
+## 换一个端口启动
 
 ```bash
 costrict-router start --addr 127.0.0.1:18080
@@ -207,7 +20,7 @@ Base URL: http://127.0.0.1:18080/v1
 API Key: sk-costrict-...
 ```
 
-### 重置本地 API Key
+## 重置本地 API Key
 
 ```bash
 costrict-router key reset
@@ -216,11 +29,58 @@ costrict-router restart
 
 如果旧 key 已遗失，只能重置生成新的 key；旧 key 会立即失效，正在运行的后台服务需要重启后才会加载新 key。
 
-### 让 codex / claude-code 的辅助功能可用
+## 配合 codex 使用
 
-codex、claude-code 的部分辅助功能会用上游不存在的模型名发请求（如 codex 的 multi-agent、claude-code 的 `claude-*`）而失效；执行 `costrict-router fallback` 从当前可用模型中选一个作为兜底，未知模型名就会被替换掉（改动需 `restart` 生效）。
+使用 codex 时通常需要额外处理两件事。
 
-### 使用独立配置文件
+**1. 让 CoStrict 模型出现在 `/model` 选择器**
+
+codex 只有在 provider 使用 command 方式鉴权（或使用 codex 官方后端）时才会去拉取模型列表，普通 API Key 方式不会拉取，所以 codex 的 `/model` 选择器默认只显示它自带的 gpt 系列，看不到 CoStrict 模型。执行：
+
+```bash
+costrict-router codex-catalog
+```
+
+它会拉取当前账号可用模型，生成 `~/.codex/costrict-router-model-catalog.json`，并把 codex `~/.codex/config.toml` 顶层的 `model_catalog_json` 指向该文件（首次改动会保留一份 `config.toml.bak` 备份）。codex 配置该项后会改用本地静态目录、不再依赖网络拉取，`/model` 选择器即可看到这些模型。
+
+几点注意：
+
+- 这是**静态快照**：上游模型增减后需要重新执行本命令刷新。
+- 配置后 codex `/model` **只会显示这些模型**，其自带的 gpt 系列会被替换掉。
+- 改动在**下次启动 codex（或新开会话）** 时生效。
+- 不想让命令自动改 `config.toml` 的话，加 `--no-config`，它只生成目录文件并打印出需要手动添加的配置行。
+- codex 主目录不在默认位置时，用 `--codex-home` 指定（或设置 `CODEX_HOME` 环境变量）。
+
+**2. 让 multi-agent 等辅助功能可用**
+
+见下方[手动指定兜底模型](#手动指定兜底模型)。
+
+## 手动指定兜底模型
+
+当请求里的模型名在上游不存在时，costrict-router 会**自动把它替换成第一个可用模型**再转发，避免请求直接失败。这类未知模型名很常见，例如：
+
+- codex 的 multi-agent、guardian 审查、记忆生成等辅助功能会用 `gpt-5.x` 之类的内部模型名；
+- claude-code 会用 `claude-*` 模型名；
+- 你在客户端里手填了一个上游没有的模型名。
+
+所以默认情况下你**不需要做任何配置**，这些功能也能正常工作。
+
+如果你不希望兜底到"第一个可用模型"，而是想指定具体替换成哪个模型，用 `fallback` 命令：
+
+```bash
+costrict-router fallback              # 交互式：列出可用模型，输入序号或模型名
+costrict-router fallback glm-5        # 直接指定
+costrict-router fallback --clear      # 清除自定义设置，恢复为「第一个可用模型」
+```
+
+说明：
+
+- 优先级：你配置的兜底模型（必须当前确实可用）> 第一个可用模型。配置的模型暂时不可用时会自动退回第一个，避免替换成无效模型。
+- 已存在于上游的模型名不受影响，原样透传。
+- 模型列表尚未成功加载时不做替换、原样转发，保证 fail-safe。
+- 改动需 `restart` 后生效（服务在启动时加载配置）。
+
+## 使用独立配置文件
 
 ```bash
 costrict-router login --base-url https://www.abc.com --config ./my-config.json
@@ -234,20 +94,20 @@ export COSTRICT_ROUTER_CONFIG=./my-config.json
 costrict-router status
 ```
 
-### 查看服务是否正常
+## 查看服务是否正常
 
 ```bash
 costrict-router status
 curl http://127.0.0.1:14567/healthz
 ```
 
-### 停止后台服务
+## 停止后台服务
 
 ```bash
 costrict-router stop
 ```
 
-### 开机自动启动服务
+## 开机自动启动服务
 
 可以根据系统服务机制配置开机启动。例如向你的模型提问：
 

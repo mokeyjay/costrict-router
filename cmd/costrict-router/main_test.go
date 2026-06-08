@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -120,4 +121,86 @@ func TestContainsModel(t *testing.T) {
 	if !containsModel(models, "Tencent-glm-5.1") || containsModel(models, "gpt-5.4") {
 		t.Fatal("containsModel 判断错误")
 	}
+}
+
+func TestSetTOMLModelCatalogJSONCreatesFile(t *testing.T) {
+	tomlPath := filepath.Join(t.TempDir(), "config.toml")
+	changed, err := setTOMLModelCatalogJSON(tomlPath, "/home/u/.codex/cat.json")
+	if err != nil || !changed {
+		t.Fatalf("应创建并改动, changed=%v err=%v", changed, err)
+	}
+	got, _ := os.ReadFile(tomlPath)
+	if strings.TrimSpace(string(got)) != `model_catalog_json = "/home/u/.codex/cat.json"` {
+		t.Fatalf("新建内容不对: %q", got)
+	}
+}
+
+func TestSetTOMLModelCatalogJSONReplacesTopLevelAndKeepsTable(t *testing.T) {
+	dir := t.TempDir()
+	tomlPath := filepath.Join(dir, "config.toml")
+	original := "model = \"gpt-5\"\nmodel_catalog_json = \"/old/path.json\"\n\n[model_providers.costrict]\nbase_url = \"http://x\"\n"
+	if err := os.WriteFile(tomlPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := setTOMLModelCatalogJSON(tomlPath, "/new/cat.json")
+	if err != nil || !changed {
+		t.Fatalf("应替换并改动, changed=%v err=%v", changed, err)
+	}
+	got, _ := os.ReadFile(tomlPath)
+	s := string(got)
+	if !strings.Contains(s, `model_catalog_json = "/new/cat.json"`) {
+		t.Fatalf("未替换为新值: %s", s)
+	}
+	if strings.Contains(s, "/old/path.json") {
+		t.Fatalf("旧值未被移除: %s", s)
+	}
+	// 其余内容（含 table）必须保留。
+	if !strings.Contains(s, "[model_providers.costrict]") || !strings.Contains(s, `base_url = "http://x"`) || !strings.Contains(s, `model = "gpt-5"`) {
+		t.Fatalf("其它内容丢失: %s", s)
+	}
+	// 首次修改应保留 .bak 原始备份。
+	bak, err := os.ReadFile(tomlPath + ".bak")
+	if err != nil || string(bak) != original {
+		t.Fatalf(".bak 备份不正确: err=%v content=%q", err, bak)
+	}
+}
+
+func TestSetTOMLModelCatalogJSONInsertsBeforeFirstTable(t *testing.T) {
+	tomlPath := filepath.Join(t.TempDir(), "config.toml")
+	original := "model = \"gpt-5\"\n\n[profiles.dev]\nmodel = \"o3\"\n"
+	if err := os.WriteFile(tomlPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setTOMLModelCatalogJSON(tomlPath, "/new/cat.json"); err != nil {
+		t.Fatal(err)
+	}
+	got := string(mustRead(t, tomlPath))
+	idxKey := strings.Index(got, "model_catalog_json")
+	idxTable := strings.Index(got, "[profiles.dev]")
+	if idxKey < 0 || idxTable < 0 || idxKey > idxTable {
+		t.Fatalf("新键应插在第一个 table 之前（保持顶层）: %s", got)
+	}
+}
+
+func TestSetTOMLModelCatalogJSONIdempotent(t *testing.T) {
+	tomlPath := filepath.Join(t.TempDir(), "config.toml")
+	if _, err := setTOMLModelCatalogJSON(tomlPath, "/cat.json"); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := setTOMLModelCatalogJSON(tomlPath, "/cat.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("值未变化时不应再改动")
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }

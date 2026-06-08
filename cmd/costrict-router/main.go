@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"costrict-router/internal/auth"
+	"costrict-router/internal/catalog"
 	"costrict-router/internal/config"
 	"costrict-router/internal/i18n"
 	"costrict-router/internal/ids"
@@ -45,6 +46,8 @@ func main() {
 		err = cmdModels(os.Args[2:])
 	case "fallback":
 		err = cmdFallback(os.Args[2:])
+	case "codex-catalog":
+		err = cmdCodexCatalog(os.Args[2:])
 	case "start":
 		err = cmdStart(os.Args[2:])
 	case "stop":
@@ -75,6 +78,7 @@ func usage() {
   costrict-router serve [--addr 127.0.0.1:14567] [--debug] [--debug-full-request]
   costrict-router models [--json]
   costrict-router fallback [model] [--clear]
+  costrict-router codex-catalog [--codex-home ~/.codex] [--no-config]
   costrict-router start [--debug] [--debug-full-request]
   costrict-router stop
   costrict-router status
@@ -86,6 +90,7 @@ func usage() {
   costrict-router serve [--addr 127.0.0.1:14567] [--debug] [--debug-full-request]
   costrict-router models [--json]
   costrict-router fallback [model] [--clear]
+  costrict-router codex-catalog [--codex-home ~/.codex] [--no-config]
   costrict-router start [--debug] [--debug-full-request]
   costrict-router stop
   costrict-router status
@@ -424,6 +429,175 @@ func printFallbackRestartHint(path string) {
 		}
 	}
 	fmt.Println(i18n.T("Restart the service for the change to take effect.", "改动需重启服务后生效。"))
+}
+
+const codexCatalogFileName = "costrict-router-model-catalog.json"
+
+// cmdCodexCatalog 生成 codex 的 model_catalog_json 文件并（默认）改写 codex 的 config.toml 指向它。
+//
+// 用途：让上游第三方模型出现在 codex `/model` 选择器。codex 配了 model_catalog_json 后会改用
+// 静态目录（不再依赖网络 /models，也不需要 command-auth），直接显示文件里的模型。
+// 注意：这是静态快照，上游模型增减后需重新执行本命令；改动在下次启动 codex 时生效。
+func cmdCodexCatalog(args []string) error {
+	fs := flag.NewFlagSet("codex-catalog", flag.ContinueOnError)
+	configPath := fs.String("config", "", i18n.T("config file path", "配置文件路径"))
+	codexHome := fs.String("codex-home", "", i18n.T("codex home directory (default $CODEX_HOME or ~/.codex)", "codex 主目录（默认 $CODEX_HOME 或 ~/.codex）"))
+	noConfig := fs.Bool("no-config", false, i18n.T("only write the catalog file; do not modify codex config.toml", "只生成目录文件，不修改 codex config.toml"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	// 拉取上游可用模型列表：先刷新 token 再拉取（与 models/fallback 一致）。
+	logger := logx.New(io.Discard, false)
+	svc := server.New(path, *cfg, logger)
+	if err := svc.EnsureFreshToken(context.Background()); err != nil {
+		return err
+	}
+	raw, err := fetchModels(context.Background(), svc.Config())
+	if err != nil {
+		return err
+	}
+	models, err := parseModelIDs(raw)
+	if err != nil {
+		return err
+	}
+	if len(models) == 0 {
+		return fmt.Errorf(i18n.T("upstream returned no available models", "上游未返回任何可用模型"))
+	}
+
+	home, err := resolveCodexHome(*codexHome)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		return err
+	}
+	catalogPath := filepath.Join(home, codexCatalogFileName)
+	data, err := catalog.Build(models).MarshalIndented()
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(catalogPath, data, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf(i18n.T("✅ Wrote model catalog (%d models): %s\n", "✅ 已生成模型目录（%d 个模型）: %s\n"), len(models), catalogPath)
+
+	if *noConfig {
+		fmt.Printf(i18n.T("Add this to your codex config.toml to use it:\n  model_catalog_json = %q\n", "请把下面这行加到 codex config.toml 启用它:\n  model_catalog_json = %q\n"), catalogPath)
+		return nil
+	}
+
+	tomlPath := filepath.Join(home, "config.toml")
+	changed, err := setTOMLModelCatalogJSON(tomlPath, catalogPath)
+	if err != nil {
+		return err
+	}
+	if changed {
+		fmt.Printf(i18n.T("✅ Updated codex config: %s\n  model_catalog_json = %q\n", "✅ 已更新 codex 配置: %s\n  model_catalog_json = %q\n"), tomlPath, catalogPath)
+	} else {
+		fmt.Printf(i18n.T("codex config already points here: %s\n", "codex 配置已指向此文件: %s\n"), tomlPath)
+	}
+	fmt.Println(i18n.T("Restart codex (or start a new session) for the change to take effect.", "请重启 codex（或新开会话）后生效。"))
+	fmt.Println(i18n.T("Note: codex will then show ONLY these models in /model (its built-in gpt list is replaced); rerun this command after the upstream model list changes.", "注意：之后 codex /model 将只显示这些模型（自带 gpt 列表被替换）；上游模型变动后请重新执行本命令。"))
+	return nil
+}
+
+// resolveCodexHome 解析 codex 主目录：显式参数 > $CODEX_HOME > ~/.codex。
+func resolveCodexHome(explicit string) (string, error) {
+	if explicit != "" {
+		return expandHome(explicit)
+	}
+	if env := strings.TrimSpace(os.Getenv("CODEX_HOME")); env != "" {
+		return expandHome(env)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".codex"), nil
+}
+
+func expandHome(path string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, path[2:]), nil
+	}
+	return path, nil
+}
+
+// setTOMLModelCatalogJSON 在 codex config.toml 顶层设置（或更新）model_catalog_json。
+// 采用按行编辑，保留其余内容；顶层键必须位于第一个 [table] 之前，否则会归属该表。
+// 首次修改会保留一份 .bak 原始备份。返回是否发生了改动。
+func setTOMLModelCatalogJSON(tomlPath, catalogPath string) (bool, error) {
+	value := "model_catalog_json = " + tomlQuote(catalogPath)
+
+	original, err := os.ReadFile(tomlPath)
+	if os.IsNotExist(err) {
+		// 配置不存在：新建一个只含该键的 config.toml。
+		return true, os.WriteFile(tomlPath, []byte(value+"\n"), 0o644)
+	}
+	if err != nil {
+		return false, err
+	}
+
+	lines := strings.Split(string(original), "\n")
+	insertAt := len(lines) // 默认追加到末尾（无 table 时）
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			// 到达第一个 table 头：顶层键须插在它前面。
+			insertAt = i
+			break
+		}
+		if strings.HasPrefix(trimmed, "model_catalog_json") {
+			if after := strings.TrimSpace(trimmed[len("model_catalog_json"):]); strings.HasPrefix(after, "=") {
+				if line == value {
+					return false, nil // 已是目标值，无需改动
+				}
+				lines[i] = value // 原地替换
+				return true, writeTOML(tomlPath, original, lines)
+			}
+		}
+	}
+
+	// 未找到顶层键：插入到第一个 table 之前（或末尾）。
+	newLines := make([]string, 0, len(lines)+1)
+	newLines = append(newLines, lines[:insertAt]...)
+	newLines = append(newLines, value)
+	newLines = append(newLines, lines[insertAt:]...)
+	return true, writeTOML(tomlPath, original, newLines)
+}
+
+// writeTOML 写回 config.toml，首次修改时保留 .bak 原始备份。
+func writeTOML(tomlPath string, original []byte, lines []string) error {
+	bak := tomlPath + ".bak"
+	if _, err := os.Stat(bak); os.IsNotExist(err) {
+		if err := os.WriteFile(bak, original, 0o644); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(tomlPath, []byte(strings.Join(lines, "\n")), 0o644)
+}
+
+// tomlQuote 把字符串转成 TOML 基本字符串（转义反斜杠与双引号）。
+func tomlQuote(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
 }
 
 type daemonState struct {
