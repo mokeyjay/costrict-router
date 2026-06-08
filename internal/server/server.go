@@ -131,6 +131,7 @@ func Run(ctx context.Context, configPath string, cfg config.Config, addr string,
 		Client:           &http.Client{},
 		Logger:           logger,
 		DebugFullRequest: debugFullRequest,
+		Models:           proxy.NewModelResolver(),
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

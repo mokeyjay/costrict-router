@@ -19,6 +19,7 @@ type Config struct {
 	Version               int       `json:"version"`
 	BaseURL               string    `json:"base_url"`
 	ListenAddr            string    `json:"listen_addr"`
+	FallbackModel         string    `json:"fallback_model,omitempty"`
 	MachineCode           string    `json:"machine_code"`
 	State                 string    `json:"state"`
 	Provider              string    `json:"provider"`

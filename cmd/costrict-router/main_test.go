@@ -73,3 +73,51 @@ func TestResetLocalAPIKeyReplacesOldKey(t *testing.T) {
 		t.Fatal("new api key does not verify after reset")
 	}
 }
+
+func TestParseModelIDs(t *testing.T) {
+	raw := []byte(`{"data":[{"id":"Auto"},{"id":"Tencent-kimi-k2.6"},{"id":""}]}`)
+	ids, err := parseModelIDs(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 || ids[0] != "Auto" || ids[1] != "Tencent-kimi-k2.6" {
+		t.Fatalf("应跳过空 id，得到: %v", ids)
+	}
+}
+
+func TestPromptFallbackSelection(t *testing.T) {
+	models := []string{"Auto", "Tencent-glm-5.1", "Tencent-kimi-k2.6"}
+
+	cases := []struct {
+		name      string
+		input     string
+		wantModel string
+		wantCh    bool
+	}{
+		{"按序号", "2\n", "Tencent-glm-5.1", true},
+		{"按模型名", "Tencent-kimi-k2.6\n", "Tencent-kimi-k2.6", true},
+		{"空行保持不变", "\n", "", false},
+		{"EOF 保持不变", "", "", false},
+		{"超范围后重试", "9\n1\n", "Auto", true},
+		{"无效名后重试", "nope\n3\n", "Tencent-kimi-k2.6", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var out bytes.Buffer
+			got, changed, err := promptFallbackSelection(strings.NewReader(c.input), &out, models)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != c.wantModel || changed != c.wantCh {
+				t.Fatalf("got=(%q,%v) want=(%q,%v)", got, changed, c.wantModel, c.wantCh)
+			}
+		})
+	}
+}
+
+func TestContainsModel(t *testing.T) {
+	models := []string{"Auto", "Tencent-glm-5.1"}
+	if !containsModel(models, "Tencent-glm-5.1") || containsModel(models, "gpt-5.4") {
+		t.Fatal("containsModel 判断错误")
+	}
+}

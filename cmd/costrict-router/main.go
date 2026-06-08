@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -41,6 +43,8 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "models":
 		err = cmdModels(os.Args[2:])
+	case "fallback":
+		err = cmdFallback(os.Args[2:])
 	case "start":
 		err = cmdStart(os.Args[2:])
 	case "stop":
@@ -70,6 +74,7 @@ func usage() {
   costrict-router login --url <plugin-login-url>
   costrict-router serve [--addr 127.0.0.1:14567] [--debug] [--debug-full-request]
   costrict-router models [--json]
+  costrict-router fallback [model] [--clear]
   costrict-router start [--debug] [--debug-full-request]
   costrict-router stop
   costrict-router status
@@ -80,6 +85,7 @@ func usage() {
   costrict-router login --url <plugin-login-url>
   costrict-router serve [--addr 127.0.0.1:14567] [--debug] [--debug-full-request]
   costrict-router models [--json]
+  costrict-router fallback [model] [--clear]
   costrict-router start [--debug] [--debug-full-request]
   costrict-router stop
   costrict-router status
@@ -263,6 +269,163 @@ func cmdModels(args []string) error {
 	return printModels(raw)
 }
 
+// cmdFallback 设置「未知模型兜底」：把上游不存在的模型名统一替换成用户选定的模型，
+// 解决 codex（multi-agent/guardian/记忆用 gpt-5.x）、claude-code（claude-*）等辅助功能因模型
+// 不存在而不可用的问题。无参数时进入交互式选择；带模型名则直接设置；--clear 清除。
+func cmdFallback(args []string) error {
+	fs := flag.NewFlagSet("fallback", flag.ContinueOnError)
+	configPath := fs.String("config", "", i18n.T("config file path", "配置文件路径"))
+	clear := fs.Bool("clear", false, i18n.T("clear the custom fallback and use the first available model", "清除自定义兜底模型，恢复为使用第一个可用模型"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	if *clear {
+		cfg.FallbackModel = ""
+		if err := cfg.Save(path); err != nil {
+			return err
+		}
+		fmt.Println(i18n.T("Cleared the custom fallback model; unknown models will use the first available model.", "已清除自定义兜底模型；未知模型将使用第一个可用模型。"))
+		printFallbackRestartHint(path)
+		return nil
+	}
+
+	// 选择/设置都需要可用模型列表：先刷新 token 再拉取。
+	logger := logx.New(io.Discard, false)
+	svc := server.New(path, *cfg, logger)
+	if err := svc.EnsureFreshToken(context.Background()); err != nil {
+		return err
+	}
+	fresh := svc.Config()
+	raw, err := fetchModels(context.Background(), fresh)
+	if err != nil {
+		return err
+	}
+	models, err := parseModelIDs(raw)
+	if err != nil {
+		return err
+	}
+	if len(models) == 0 {
+		return fmt.Errorf(i18n.T("upstream returned no available models", "上游未返回任何可用模型"))
+	}
+
+	// 直接指定模型名：costrict-router fallback <model>
+	if rest := fs.Args(); len(rest) > 0 {
+		chosen := rest[0]
+		if !containsModel(models, chosen) {
+			return fmt.Errorf(i18n.T("model %q is not in the available list; run `costrict-router models` to see options", "模型 %q 不在可用列表中；执行 `costrict-router models` 查看可选项"), chosen)
+		}
+		return saveFallback(path, cfg, chosen)
+	}
+
+	// 交互式选择。
+	printFallbackIntro(cfg.FallbackModel, models)
+	chosen, changed, err := promptFallbackSelection(os.Stdin, os.Stdout, models)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		fmt.Println(i18n.T("Kept the current setting; nothing changed.", "保持当前设置，未做修改。"))
+		return nil
+	}
+	return saveFallback(path, cfg, chosen)
+}
+
+func parseModelIDs(raw []byte) ([]string, error) {
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(payload.Data))
+	for _, m := range payload.Data {
+		if m.ID != "" {
+			out = append(out, m.ID)
+		}
+	}
+	return out, nil
+}
+
+func containsModel(models []string, id string) bool {
+	for _, m := range models {
+		if m == id {
+			return true
+		}
+	}
+	return false
+}
+
+// printFallbackIntro 只列出当前兜底模型与实时拉取的可用模型，供选择，不输出额外说明。
+func printFallbackIntro(current string, models []string) {
+	cur := current
+	if cur == "" {
+		cur = i18n.T("(not set)", "（未设置）")
+	}
+	fmt.Printf(i18n.T("Current fallback model: %s\n\nAvailable models:\n", "当前兜底模型: %s\n\n可用模型:\n"), cur)
+	for i, id := range models {
+		fmt.Printf("  %d) %s\n", i+1, id)
+	}
+	fmt.Println()
+}
+
+// promptFallbackSelection 读取序号或模型名；空行/EOF 表示保持不变。无效输入时重试。
+func promptFallbackSelection(in io.Reader, out io.Writer, models []string) (chosen string, changed bool, err error) {
+	scanner := bufio.NewScanner(in)
+	for {
+		fmt.Fprint(out, i18n.T("Enter a number or model name (empty = keep current): ", "请输入序号或模型名（直接回车保持不变）: "))
+		if !scanner.Scan() {
+			return "", false, scanner.Err()
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			return "", false, nil
+		}
+		if n, convErr := strconv.Atoi(line); convErr == nil {
+			if n >= 1 && n <= len(models) {
+				return models[n-1], true, nil
+			}
+			fmt.Fprintf(out, i18n.T("Number out of range (1-%d); try again.\n", "序号超出范围（1-%d），请重试。\n"), len(models))
+			continue
+		}
+		if containsModel(models, line) {
+			return line, true, nil
+		}
+		fmt.Fprintln(out, i18n.T("Not a valid number or model name; try again.", "不是有效的序号或模型名，请重试。"))
+	}
+}
+
+func saveFallback(path string, cfg *config.Config, model string) error {
+	cfg.FallbackModel = model
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+	fmt.Printf(i18n.T("Fallback model set to: %s\n", "兜底模型已设为: %s\n"), model)
+	printFallbackRestartHint(path)
+	return nil
+}
+
+func printFallbackRestartHint(path string) {
+	// 与 key reset 一致：服务在启动时加载配置，改动需重启后生效。
+	if pidPath, err := config.DefaultPIDPath(); err == nil {
+		if state, err := readDaemonState(pidPath); err == nil && state.ConfigPath == path {
+			fmt.Printf(i18n.T("A service using this config appears to be running at http://%s/v1; restart it for the change to take effect: costrict-router restart\n", "检测到使用该配置的服务可能在运行: http://%s/v1；请重启后生效: costrict-router restart\n"), state.Addr)
+			return
+		}
+	}
+	fmt.Println(i18n.T("Restart the service for the change to take effect.", "改动需重启服务后生效。"))
+}
+
 type daemonState struct {
 	PID        int       `json:"pid"`
 	Addr       string    `json:"addr"`
@@ -283,6 +446,8 @@ func cmdStart(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// 记录用户是否显式指定了 --addr，用于在已有服务监听地址不同步时给出明确提示。
+	explicitAddr := *addr
 	path, err := resolveConfigPath(*configPath)
 	if err != nil {
 		return err
@@ -309,6 +474,13 @@ func cmdStart(args []string) error {
 	if running, _ := readDaemonState(*pidPath); running.PID > 0 {
 		// 已有 PID 时用健康检查确认真实存活，避免重复启动占用同一端口。
 		if health, err := fetchHealth(running.Addr); err == nil {
+			// 用户显式要求的监听地址与正在运行的不同：不能静默忽略，否则会误以为新地址已生效。
+			if explicitAddr != "" && explicitAddr != running.Addr {
+				return fmt.Errorf(i18n.T(
+					"a service is already running on %s, but you requested --addr=%s; run `costrict-router restart --addr=%s` to apply the new address (or stop it first)",
+					"服务已在 %s 上运行，但你请求的是 --addr=%s；请执行 `costrict-router restart --addr=%s` 应用新地址（或先 stop 再 start）"),
+					running.Addr, explicitAddr, explicitAddr)
+			}
 			fmt.Printf(i18n.T("🟢 Service already running: http://%s/v1\n%s\n", "🟢 服务已在运行: http://%s/v1\n%s\n"), running.Addr, health)
 			if cfg.LocalAPIKeyHash != "" {
 				fmt.Println(i18n.T("Local API Key is already configured; if you lost it, run: costrict-router key reset", "本地 API Key 已配置；如已遗失，请执行: costrict-router key reset"))

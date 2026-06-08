@@ -59,6 +59,7 @@ docker run -d --name costrict-router \
 | `restart` | 重启后台服务 | `costrict-router restart` |
 | `logs` | 监看日志 | `costrict-router logs` |
 | `models` | 查看可用模型 | `costrict-router models` |
+| `fallback` | 设置未知模型的兜底模型 | `costrict-router fallback` |
 | `key reset` | 重置本地 API Key | `costrict-router key reset` |
 
 ## 命令参数
@@ -214,6 +215,10 @@ costrict-router restart
 ```
 
 如果旧 key 已遗失，只能重置生成新的 key；旧 key 会立即失效，正在运行的后台服务需要重启后才会加载新 key。
+
+### 让 codex / claude-code 的辅助功能可用
+
+codex、claude-code 的部分辅助功能会用上游不存在的模型名发请求（如 codex 的 multi-agent、claude-code 的 `claude-*`）而失效；执行 `costrict-router fallback` 从当前可用模型中选一个作为兜底，未知模型名就会被替换掉（改动需 `restart` 生效）。
 
 ### 使用独立配置文件
 
