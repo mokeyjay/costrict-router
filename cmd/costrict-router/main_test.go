@@ -204,3 +204,88 @@ func mustRead(t *testing.T, path string) []byte {
 	}
 	return data
 }
+
+func TestConfirmYes(t *testing.T) {
+	cases := []struct {
+		input string
+		want  bool
+	}{
+		{"yes\n", true},
+		{"YES\n", true},
+		{" yes \n", true},
+		{"y\n", false},
+		{"no\n", false},
+		{"\n", false},
+		{"", false}, // EOF
+	}
+	for _, c := range cases {
+		var out bytes.Buffer
+		if got := confirmYes(strings.NewReader(c.input), &out, "? "); got != c.want {
+			t.Fatalf("confirmYes(%q)=%v want=%v", c.input, got, c.want)
+		}
+	}
+}
+
+func TestIsLoopbackListenAddr(t *testing.T) {
+	cases := []struct {
+		addr string
+		want bool
+	}{
+		{"127.0.0.1:14567", true},
+		{"localhost:14567", true},
+		{"[::1]:14567", true},
+		{"0.0.0.0:14567", false}, // 所有网卡
+		{":14567", false},        // 空 host = 所有网卡
+		{"192.168.1.10:14567", false},
+		{"example.com:14567", false}, // 无法判定的主机名按非回环处理
+	}
+	for _, c := range cases {
+		if got := isLoopbackListenAddr(c.addr); got != c.want {
+			t.Fatalf("isLoopbackListenAddr(%q)=%v want=%v", c.addr, got, c.want)
+		}
+	}
+}
+
+func TestAuthDisabledWarningEscalatesOnNonLoopback(t *testing.T) {
+	// 回环地址：只有基础警告。
+	if strings.Contains(authDisabledWarning("127.0.0.1:14567"), "🚨") {
+		t.Fatal("回环地址不应出现暴露网络的升级告警")
+	}
+	// 非回环地址：必须出现升级告警。
+	w := authDisabledWarning("0.0.0.0:14567")
+	if !strings.Contains(w, "🚨") || !strings.Contains(w, "0.0.0.0:14567") {
+		t.Fatalf("非回环地址应出现升级告警且含地址, got: %s", w)
+	}
+}
+
+func TestAuthDisableEnableRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.Default()
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	// disable --yes 跳过确认，写入 auth_disabled=true。
+	if err := cmdAuthDisable([]string{"--config", path, "--yes"}); err != nil {
+		t.Fatalf("auth disable: %v", err)
+	}
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.AuthDisabled {
+		t.Fatal("disable 后 AuthDisabled 应为 true")
+	}
+
+	// enable 恢复。
+	if err := cmdAuthEnable([]string{"--config", path}); err != nil {
+		t.Fatalf("auth enable: %v", err)
+	}
+	got, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AuthDisabled {
+		t.Fatal("enable 后 AuthDisabled 应为 false")
+	}
+}

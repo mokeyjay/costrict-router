@@ -30,6 +30,33 @@ costrict-router restart
 
 如果旧 key 已遗失，只能重置生成新的 key；旧 key 会立即失效，正在运行的后台服务需要重启后才会加载新 key。
 
+## 关闭本地鉴权
+
+默认情况下，所有 `/v1/*` 接口都要带本地 API Key。如果你在一个**可信、仅本机可访问**的环境里嫌每次配 key 麻烦，可以关闭鉴权——关闭后请求不带 token 或带空 token 都能直接调用。
+
+```bash
+costrict-router auth disable     # 高危操作，会要求输入 yes 二次确认
+costrict-router restart
+```
+
+> ⚠️ 关闭鉴权意味着**任何能访问监听地址的客户端，都能在无需 API Key 的情况下使用你的 CoStrict 账号**。请务必确认监听地址没有暴露到外部网络（如不要配合 `--addr 0.0.0.0:...` 使用）。
+
+关闭后，每次 `serve` / `start` 都会打印一条安全警告，提醒鉴权处于关闭状态。如果此时监听地址**不是回环地址**（即可能被外部访问），警告会升级为更醒目的提示——`auth disable` 时也会基于你配置的监听地址给出同样的额外提醒。
+
+重新开启：
+
+```bash
+costrict-router auth enable
+costrict-router restart
+```
+
+说明：
+
+- 关闭/开启只影响**本地鉴权**（客户端 → 本服务），不影响上游 CoStrict 的登录态。
+- 改动需 `restart` 后生效（服务在启动时加载配置）。
+- 脚本里可用 `costrict-router auth disable --yes` 跳过二次确认。
+- 重新开启后若没有本地 API Key，会在下次 `start` 时自动生成。
+
 ## 手动指定兜底模型
 
 当请求里的模型名在上游不存在时，costrict-router 会**自动把它替换成第一个可用模型**再转发，避免请求直接失败。这类未知模型名很常见，例如：

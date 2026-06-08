@@ -80,6 +80,8 @@ costrict-router start
 
 > 💡 **使用 codex 的话**，需要额外配置 provider 并生成模型目录，详见 [在 codex 中使用](./docs/codex.md)。
 
+> ⚠️ 如果你有特殊需要，本项目也支持 **[关闭本地鉴权](./docs/advanced-usage.md#关闭本地鉴权)**
+
 ## 🔌 本地接口
 
 所有 `/v1/*` 接口都需要使用本地 API Key，两种鉴权头都支持（OpenAI 风格用 `Authorization`，Anthropic 风格用 `x-api-key`）：

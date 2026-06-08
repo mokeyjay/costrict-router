@@ -68,7 +68,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter) {
 	cfg := h.Tokens.Config()
 	payload := map[string]any{
 		"ok":                       cfg.LoggedIn(),
-		"base_url":                 cfg.BaseURL,
+		"base_url":                 config.Redact(cfg.BaseURL),
 		"listen_addr":              cfg.ListenAddr,
 		"machine_code":             config.Redact(cfg.MachineCode),
 		"user_id":                  config.Redact(cfg.UserID),
@@ -76,6 +76,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter) {
 		"refresh_token":            config.Redact(cfg.RefreshToken),
 		"access_expires":           cfg.AccessTokenExpiresAt,
 		"local_api_key_configured": cfg.LocalAPIKeyHash != "",
+		"auth_disabled":            cfg.AuthDisabled,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(payload)
@@ -83,6 +84,10 @@ func (h *Handler) handleHealth(w http.ResponseWriter) {
 
 func (h *Handler) authorizeLocalAPIKey(w http.ResponseWriter, r *http.Request) bool {
 	cfg := h.Tokens.Config()
+	if cfg.AuthDisabled {
+		// 鉴权已被显式关闭：不校验本地 API Key，无 token 或空 token 均放行。
+		return true
+	}
 	if cfg.LocalAPIKeyHash == "" {
 		writeOpenAIError(w, http.StatusInternalServerError, "configuration_error", i18n.T("local API key is not configured; restart costrict-router to generate one", "本地 API Key 未配置，请重启 costrict-router 生成"))
 		return false

@@ -15,6 +15,8 @@
 | `fallback` | 设置未知模型的兜底模型 | `costrict-router fallback` |
 | `codex-catalog` | 生成 codex 模型目录，让 CoStrict 模型出现在 codex `/model` 选择器 | `costrict-router codex-catalog` |
 | `key reset` | 重置本地 API Key | `costrict-router key reset` |
+| `auth disable` | 关闭本地鉴权（需二次确认） | `costrict-router auth disable` |
+| `auth enable` | 重新开启本地鉴权 | `costrict-router auth enable` |
 
 ## 命令参数
 
@@ -73,6 +75,15 @@
 | 参数 | 说明 |
 | --- | --- |
 | `--config` | 指定配置文件路径 |
+
+### `auth disable` / `auth enable`
+
+开关本地鉴权。`disable` 是高危操作，需二次确认。详见 [高级用法 - 关闭本地鉴权](./advanced-usage.md#关闭本地鉴权)。
+
+| 参数 | 说明 |
+| --- | --- |
+| `--config` | 指定配置文件路径 |
+| `--yes` | 仅 `disable`：跳过二次确认（用于脚本） |
 
 ## 日志调试
 

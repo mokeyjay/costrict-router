@@ -280,6 +280,46 @@ func TestModelsRequiresLocalAPIKey(t *testing.T) {
 	}
 }
 
+func TestAuthDisabledBypassesLocalAPIKey(t *testing.T) {
+	called := false
+	handler := &Handler{
+		Tokens: &fakeTokens{cfg: config.Config{
+			BaseURL:      "https://example.com",
+			AccessToken:  "access",
+			RefreshToken: "refresh",
+			// 鉴权已关闭：无 LocalAPIKeyHash、无 Authorization 头也应放行。
+			AuthDisabled: true,
+		}},
+		Client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			called = true
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"data":[]}`)),
+			}, nil
+		})},
+	}
+
+	// 不带任何 token 也能通过。
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("鉴权关闭时无 token 应放行, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !called {
+		t.Fatal("鉴权关闭时请求应转发到上游")
+	}
+
+	// 带空 token 也能通过。
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer ")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("鉴权关闭时空 token 应放行, status=%d", rec.Code)
+	}
+}
+
 func TestDebugLogsChatMetricsWithoutRequestBody(t *testing.T) {
 	apiKey, apiKeyHash := localAPIKeyForTest(t)
 	var logs strings.Builder
@@ -421,6 +461,10 @@ func TestHealthzRedactsTokens(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "abcdefghijklmnopqrstuvwxyz") {
 		t.Fatalf("healthz leaked token-like value: %s", rec.Body.String())
+	}
+	// base_url 也要脱敏，不能在 healthz（无鉴权）里暴露完整的私有上游地址。
+	if strings.Contains(rec.Body.String(), "https://example.com") {
+		t.Fatalf("healthz leaked full base_url: %s", rec.Body.String())
 	}
 	if payload["local_api_key_configured"] != true {
 		t.Fatalf("local_api_key_configured = %v", payload["local_api_key_configured"])

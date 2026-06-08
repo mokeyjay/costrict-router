@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -60,6 +61,8 @@ func main() {
 		err = cmdLogs(os.Args[2:])
 	case "key":
 		err = cmdKey(os.Args[2:])
+	case "auth":
+		err = cmdAuth(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -84,7 +87,9 @@ func usage() {
   costrict-router status
   costrict-router restart
   costrict-router logs
-  costrict-router key reset`, `用法:
+  costrict-router key reset
+  costrict-router auth disable [--yes]
+  costrict-router auth enable`, `用法:
   costrict-router login --base-url https://example.com
   costrict-router login --url <plugin-login-url>
   costrict-router serve [--addr 127.0.0.1:14567] [--debug] [--debug-full-request]
@@ -96,7 +101,9 @@ func usage() {
   costrict-router status
   costrict-router restart
   costrict-router logs
-  costrict-router key reset`))
+  costrict-router key reset
+  costrict-router auth disable [--yes]
+  costrict-router auth enable`))
 }
 
 func cmdLogin(args []string) error {
@@ -216,8 +223,10 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := ensureLocalAPIKey(path, cfg, os.Stdout); err != nil {
-		return err
+	if !cfg.AuthDisabled {
+		if _, err := ensureLocalAPIKey(path, cfg, os.Stdout); err != nil {
+			return err
+		}
 	}
 	debugEnabled := *debug || *debugFullRequest
 	logger, closeLogger, err := buildLogger(*logFile, debugEnabled)
@@ -226,6 +235,9 @@ func cmdServe(args []string) error {
 	}
 	defer closeLogger()
 	logger.Infof(i18n.T("Config file: %s", "配置文件: %s"), path)
+	if cfg.AuthDisabled {
+		logger.Warnf("%s", authDisabledWarning(firstNonEmpty(*addr, cfg.ListenAddr)))
+	}
 	if debugEnabled {
 		logger.Warnf(i18n.T("debug is enabled; chat metrics will be logged", "debug 已开启，将记录对话指标"))
 	}
@@ -234,7 +246,8 @@ func cmdServe(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return server.Run(ctx, path, *cfg, *addr, logger, *debugFullRequest)
+	// shutdown token 仅由 start 通过环境变量注入；前台 serve 无 token，则 /-/shutdown 一律拒绝（用 Ctrl+C 退出）。
+	return server.Run(ctx, path, *cfg, *addr, logger, *debugFullRequest, os.Getenv(envShutdownToken))
 }
 
 func cmdModels(args []string) error {
@@ -299,7 +312,7 @@ func cmdFallback(args []string) error {
 			return err
 		}
 		fmt.Println(i18n.T("Cleared the custom fallback model; unknown models will use the first available model.", "已清除自定义兜底模型；未知模型将使用第一个可用模型。"))
-		printFallbackRestartHint(path)
+		printRestartHint(path)
 		return nil
 	}
 
@@ -443,11 +456,11 @@ func saveFallback(path string, cfg *config.Config, model string) error {
 		return err
 	}
 	fmt.Printf(i18n.T("Fallback model set to: %s\n", "兜底模型已设为: %s\n"), model)
-	printFallbackRestartHint(path)
+	printRestartHint(path)
 	return nil
 }
 
-func printFallbackRestartHint(path string) {
+func printRestartHint(path string) {
 	// 与 key reset 一致：服务在启动时加载配置，改动需重启后生效。
 	if pidPath, err := config.DefaultPIDPath(); err == nil {
 		if state, err := readDaemonState(pidPath); err == nil && state.ConfigPath == path {
@@ -627,12 +640,17 @@ func tomlQuote(s string) string {
 	return `"` + s + `"`
 }
 
+// envShutdownToken 用于把 start 生成的 shutdown token 传给后台 serve 子进程（避免出现在命令行 ps 中）。
+const envShutdownToken = "COSTRICT_ROUTER_SHUTDOWN_TOKEN"
+
 type daemonState struct {
 	PID        int       `json:"pid"`
 	Addr       string    `json:"addr"`
 	ConfigPath string    `json:"config_path"`
 	LogPath    string    `json:"log_path"`
 	StartedAt  time.Time `json:"started_at"`
+	// ShutdownToken 是本进程的关停凭证，随 PID 文件（0600）落盘，stop 读取后用它鉴权请求 /-/shutdown。
+	ShutdownToken string `json:"shutdown_token,omitempty"`
 }
 
 func cmdStart(args []string) error {
@@ -659,6 +677,9 @@ func cmdStart(args []string) error {
 	}
 	if *addr == "" {
 		*addr = cfg.ListenAddr
+	}
+	if cfg.AuthDisabled {
+		fmt.Fprintln(os.Stderr, authDisabledWarning(*addr))
 	}
 	if *logPath == "" {
 		*logPath, err = config.DefaultLogPath()
@@ -691,8 +712,10 @@ func cmdStart(args []string) error {
 			return nil
 		}
 	}
-	if _, err := ensureLocalAPIKey(path, cfg, os.Stdout); err != nil {
-		return err
+	if !cfg.AuthDisabled {
+		if _, err := ensureLocalAPIKey(path, cfg, os.Stdout); err != nil {
+			return err
+		}
 	}
 
 	exe, err := os.Executable()
@@ -714,19 +737,24 @@ func cmdStart(args []string) error {
 		return err
 	}
 	defer logFile.Close()
+	// 为本次后台进程生成一次性 shutdown token：通过环境变量传给子进程（不进命令行），
+	// 同时随 PID 文件落盘供 stop 读取，使 /-/shutdown 具备本机鉴权。
+	shutdownToken := ids.UUID()
 	cmd := exec.Command(exe, childArgs...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	cmd.Env = append(os.Environ(), envShutdownToken+"="+shutdownToken)
 	detachProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	state := daemonState{
-		PID:        cmd.Process.Pid,
-		Addr:       *addr,
-		ConfigPath: path,
-		LogPath:    *logPath,
-		StartedAt:  time.Now(),
+		PID:           cmd.Process.Pid,
+		Addr:          *addr,
+		ConfigPath:    path,
+		LogPath:       *logPath,
+		StartedAt:     time.Now(),
+		ShutdownToken: shutdownToken,
 	}
 	if err := writeDaemonState(*pidPath, state); err != nil {
 		_ = cmd.Process.Kill()
@@ -759,14 +787,17 @@ func cmdStop(args []string) error {
 	if err != nil {
 		return err
 	}
-	if state.Addr != "" {
+	if state.Addr != "" && state.ShutdownToken != "" {
 		req, _ := http.NewRequest(http.MethodPost, "http://"+state.Addr+"/-/shutdown", nil)
+		req.Header.Set(server.ShutdownTokenHeader, state.ShutdownToken)
 		resp, err := http.DefaultClient.Do(req)
 		if err == nil {
 			_ = resp.Body.Close()
-			_ = os.Remove(path)
-			fmt.Printf(i18n.T("🛑 Service stopped: %s\n", "🛑 服务已停止: %s\n"), state.Addr)
-			return nil
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				_ = os.Remove(path)
+				fmt.Printf(i18n.T("🛑 Service stopped: %s\n", "🛑 服务已停止: %s\n"), state.Addr)
+				return nil
+			}
 		}
 	}
 	if state.PID > 0 {
@@ -910,6 +941,139 @@ func cmdKeyReset(args []string) error {
 		}
 	}
 	return nil
+}
+
+// authDisabledWarning 是关闭鉴权后 serve/start 时反复提示的安全警告文案。
+// 当监听地址不是回环地址（账号会暴露给网络）时追加一条更强的告警。
+func authDisabledWarning(listenAddr string) string {
+	msg := i18n.T(
+		"⚠️  authentication is DISABLED: any client that can reach the listen address can use your CoStrict account with no API key. Re-enable with `costrict-router auth enable`.",
+		"⚠️  鉴权已关闭：任何能访问监听地址的客户端无需 API Key 即可使用你的 CoStrict 账号。用 `costrict-router auth enable` 重新开启。",
+	)
+	if !isLoopbackListenAddr(listenAddr) {
+		msg += "\n" + fmt.Sprintf(i18n.T(
+			"🚨  listen address %q is NOT loopback — with auth disabled your account is exposed to the network. Bind to 127.0.0.1 or re-enable auth.",
+			"🚨  监听地址 %q 不是回环地址——在鉴权关闭的情况下你的账号会暴露给网络。请改绑 127.0.0.1，或重新开启鉴权。",
+		), listenAddr)
+	}
+	return msg
+}
+
+// isLoopbackListenAddr 判断监听地址是否仅限本机（回环）。无法解析或绑定到所有网卡时按非回环（更危险）处理。
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		host = strings.TrimSpace(addr)
+	}
+	if host == "" {
+		return false // 空 host = 绑定所有网卡
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false // 解析不了的主机名，保守地按非回环处理
+	}
+	return ip.IsLoopback()
+}
+
+func cmdAuth(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf(i18n.T("usage: costrict-router auth <disable|enable> [--config path] [--yes]", "用法: costrict-router auth <disable|enable> [--config path] [--yes]"))
+	}
+	switch args[0] {
+	case "disable":
+		return cmdAuthDisable(args[1:])
+	case "enable":
+		return cmdAuthEnable(args[1:])
+	default:
+		return fmt.Errorf(i18n.T("unknown auth command: %s", "未知 auth 命令: %s"), args[0])
+	}
+}
+
+// cmdAuthDisable 关闭本地鉴权（客户端无需 API Key 即可调用）。属高危操作，需二次确认。
+func cmdAuthDisable(args []string) error {
+	fs := flag.NewFlagSet("auth disable", flag.ContinueOnError)
+	configPath := fs.String("config", "", i18n.T("config file path", "配置文件路径"))
+	assumeYes := fs.Bool("yes", false, i18n.T("skip the confirmation prompt", "跳过二次确认"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+	if cfg.AuthDisabled {
+		fmt.Println(i18n.T("Authentication is already disabled.", "鉴权当前已是关闭状态。"))
+		return nil
+	}
+
+	// 二次确认：关闭鉴权风险较高，要求用户显式输入 yes。
+	fmt.Println(i18n.T("⚠️  Disabling authentication lets ANY client that can reach the listen address use your CoStrict account WITHOUT an API key.", "⚠️  关闭鉴权后，任何能访问监听地址的客户端都可以在【无需 API Key】的情况下使用你的 CoStrict 账号。"))
+	fmt.Println(i18n.T("   Only do this when the listen address is trusted and local-only.", "   请仅在监听地址可信、仅本机可访问时这样做。"))
+	if !isLoopbackListenAddr(cfg.ListenAddr) {
+		fmt.Printf(i18n.T("🚨  Your configured listen address %q is NOT loopback — disabling auth would expose your account to the network.\n", "🚨  你配置的监听地址 %q 不是回环地址——关闭鉴权会把账号暴露给网络。\n"), cfg.ListenAddr)
+	}
+	if !*assumeYes {
+		if !confirmYes(os.Stdin, os.Stdout, i18n.T("Type 'yes' to confirm: ", "输入 yes 确认关闭: ")) {
+			fmt.Println(i18n.T("Aborted; authentication unchanged.", "已取消，鉴权设置未改变。"))
+			return nil
+		}
+	}
+
+	cfg.AuthDisabled = true
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+	fmt.Println(i18n.T("🔓 Authentication disabled.", "🔓 鉴权已关闭。"))
+	printRestartHint(path)
+	return nil
+}
+
+// cmdAuthEnable 重新开启本地鉴权。
+func cmdAuthEnable(args []string) error {
+	fs := flag.NewFlagSet("auth enable", flag.ContinueOnError)
+	configPath := fs.String("config", "", i18n.T("config file path", "配置文件路径"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+	if !cfg.AuthDisabled {
+		fmt.Println(i18n.T("Authentication is already enabled.", "鉴权当前已是开启状态。"))
+		return nil
+	}
+	cfg.AuthDisabled = false
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+	fmt.Println(i18n.T("🔒 Authentication enabled.", "🔒 鉴权已开启。"))
+	if cfg.LocalAPIKeyHash == "" {
+		fmt.Println(i18n.T("No local API key is configured yet; one will be generated on the next start.", "尚未配置本地 API Key；下次 start 时会自动生成。"))
+	}
+	printRestartHint(path)
+	return nil
+}
+
+// confirmYes 打印提示并要求用户输入 yes（忽略大小写）才返回 true；EOF/空行视为否。
+func confirmYes(in io.Reader, out io.Writer, prompt string) bool {
+	fmt.Fprint(out, prompt)
+	scanner := bufio.NewScanner(in)
+	if !scanner.Scan() {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(scanner.Text()), "yes")
 }
 
 func fetchModels(ctx context.Context, cfg config.Config) ([]byte, error) {
