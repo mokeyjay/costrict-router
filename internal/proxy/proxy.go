@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"costrict-router/internal/compat"
 	"costrict-router/internal/config"
 	"costrict-router/internal/i18n"
 	"costrict-router/internal/ids"
@@ -33,10 +32,6 @@ type Handler struct {
 	DebugFullRequest bool
 }
 
-type requestTransformer func([]byte) ([]byte, bool, error)
-type responseTransformer func([]byte) ([]byte, error)
-type streamTransformer func(io.Reader, string) io.Reader
-
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
@@ -46,16 +41,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.forward(w, r, "/chat-rag/api/v1/chat/completions", true)
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
-		if !h.authorizeLocalAPIKey(w, r) {
-			return
-		}
-		h.forwardCompat(w, r, "responses", compat.ConvertResponsesRequest, compat.ConvertChatCompletionToResponses, compat.TransformChatCompletionStreamToResponses)
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
-		if !h.authorizeLocalAPIKey(w, r) {
-			return
-		}
-		h.forwardCompat(w, r, "messages", compat.ConvertAnthropicMessagesRequest, compat.ConvertChatCompletionToAnthropicMessage, compat.TransformChatCompletionStreamToAnthropic)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		if !h.authorizeLocalAPIKey(w, r) {
 			return
@@ -73,7 +58,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter) {
 		"base_url":                 cfg.BaseURL,
 		"listen_addr":              cfg.ListenAddr,
 		"machine_code":             config.Redact(cfg.MachineCode),
-		"user_id":                  config.Redact(cfg.UserID),
+		"user_id":                  cfg.UserID,
 		"access_token":             config.Redact(cfg.AccessToken),
 		"refresh_token":            config.Redact(cfg.RefreshToken),
 		"access_expires":           cfg.AccessTokenExpiresAt,
@@ -91,10 +76,6 @@ func (h *Handler) authorizeLocalAPIKey(w http.ResponseWriter, r *http.Request) b
 	}
 	apiKey, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok || apiKey == "" {
-		// Anthropic 风格客户端用 x-api-key 鉴权，OpenAI 风格用 Authorization: Bearer，两者都接受。
-		apiKey = strings.TrimSpace(r.Header.Get("x-api-key"))
-	}
-	if apiKey == "" {
 		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("missing local API key", "缺少本地 API Key"))
 		return false
 	}
@@ -103,121 +84,6 @@ func (h *Handler) authorizeLocalAPIKey(w http.ResponseWriter, r *http.Request) b
 		return false
 	}
 	return true
-}
-
-func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, kind string, transformRequest requestTransformer, transformResponse responseTransformer, transformStream streamTransformer) {
-	start := time.Now()
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
-		return
-	}
-	chatBody, stream, err := transformRequest(bodyBytes)
-	if err != nil {
-		if apiErr := compat.AsAPIError(err); apiErr != nil {
-			writeOpenAIError(w, apiErr.Status, apiErr.Type, apiErr.Message)
-			return
-		}
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
-		return
-	}
-
-	if err := h.Tokens.EnsureFreshToken(r.Context()); err != nil {
-		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", err.Error())
-		return
-	}
-	cfg := h.Tokens.Config()
-	if !cfg.LoggedIn() {
-		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
-		return
-	}
-
-	upstreamURL, err := joinURL(cfg.BaseURL, "/chat-rag/api/v1/chat/completions")
-	if err != nil {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "configuration_error", err.Error())
-		return
-	}
-	if r.URL.RawQuery != "" {
-		upstreamURL += "?" + r.URL.RawQuery
-	}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(chatBody))
-	if err != nil {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "proxy_error", err.Error())
-		return
-	}
-	copySelectedHeaders(req.Header, r.Header)
-	req.Header.Set("Content-Type", "application/json")
-	applyCostrictHeaders(req.Header, cfg, r)
-
-	requestID := req.Header.Get("X-Request-ID")
-	chatSummary := summarizeChatRequest(chatBody)
-	if h.Logger != nil && h.Logger.DebugEnabled() && h.DebugFullRequest {
-		h.Logger.Debugf("forward %s request id=%s method=%s path=%s upstream=%s headers=%v body=%q",
-			kind, requestID, r.Method, r.URL.Path, upstreamURL, logx.RedactHeader(req.Header), logx.TruncateBody(chatBody, 32*1024))
-	}
-
-	resp, err := h.httpClient().Do(req)
-	headersAt := time.Now()
-	if err != nil {
-		if h.Logger != nil {
-			h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
-		}
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
-		return
-	}
-	defer resp.Body.Close()
-
-	status := resp.StatusCode
-	outputFormat := responseFormat(resp.Header)
-	var responseBody io.Reader = resp.Body
-	if status >= 200 && status < 300 {
-		if stream && outputFormat == "sse" {
-			responseBody = transformStream(resp.Body, modelName(chatBody))
-			copyTransformedResponseHeaders(w.Header(), resp.Header, "text/event-stream")
-			outputFormat = "sse"
-		} else {
-			upstreamBody, readErr := io.ReadAll(resp.Body)
-			if readErr != nil {
-				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", readErr.Error())
-				return
-			}
-			converted, convertErr := transformResponse(upstreamBody)
-			if convertErr != nil {
-				writeOpenAIError(w, http.StatusBadGateway, "proxy_error", convertErr.Error())
-				return
-			}
-			responseBody = bytes.NewReader(converted)
-			copyTransformedResponseHeaders(w.Header(), resp.Header, "application/json")
-			outputFormat = "json"
-		}
-	} else {
-		// 上游错误体是 OpenAI 形状，转换成目标格式的错误信封，避免客户端 SDK 解析失败。
-		upstreamBody, _ := io.ReadAll(resp.Body)
-		responseBody = bytes.NewReader(convertUpstreamError(kind, status, upstreamBody))
-		copyTransformedResponseHeaders(w.Header(), resp.Header, "application/json")
-		outputFormat = "json"
-	}
-
-	var collector *responseMetricsCollector
-	if h.Logger != nil && h.Logger.DebugEnabled() {
-		collector = newResponseMetricsCollector(start, headersAt, outputFormat)
-		responseBody = collector.wrap(responseBody)
-	}
-	w.WriteHeader(status)
-	_, copyErr := copyAndFlush(w, responseBody)
-	if h.Logger != nil {
-		if h.Logger.DebugEnabled() {
-			if collector != nil {
-				h.logChatMetrics(requestID, r, status, start, chatSummary, collector.finish(), len(chatBody), copyErr)
-			}
-		} else if status >= 400 {
-			h.Logger.Warnf(i18n.T("upstream returned error method=%s path=%s status=%d request_id=%s duration=%s", "上游返回错误 method=%s path=%s status=%d request_id=%s duration=%s"),
-				r.Method, r.URL.Path, status, requestID, time.Since(start))
-		}
-	}
-	if copyErr != nil && h.Logger != nil {
-		h.Logger.Warnf(i18n.T("failed to copy upstream response request_id=%s err=%v", "复制上游响应失败 request_id=%s err=%v"), requestID, copyErr)
-	}
 }
 
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath string, isChatCompletion bool) {
@@ -384,18 +250,6 @@ func copyResponseHeaders(dst, src http.Header) {
 	}
 }
 
-func copyTransformedResponseHeaders(dst, src http.Header, contentType string) {
-	for key, values := range src {
-		if isHopByHop(key) || strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Content-Type") {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-	dst.Set("Content-Type", contentType)
-}
-
 func isHopByHop(key string) bool {
 	switch strings.ToLower(key) {
 	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
@@ -439,98 +293,6 @@ func (h *Handler) httpClient() *http.Client {
 		return h.Client
 	}
 	return http.DefaultClient
-}
-
-func modelName(body []byte) string {
-	var payload struct {
-		Model string `json:"model"`
-	}
-	_ = json.Unmarshal(body, &payload)
-	return payload.Model
-}
-
-func convertUpstreamError(kind string, status int, body []byte) []byte {
-	message := extractUpstreamErrorMessage(body)
-	if message == "" {
-		message = http.StatusText(status)
-	}
-	var payload map[string]any
-	if kind == "messages" {
-		payload = map[string]any{
-			"type": "error",
-			"error": map[string]any{
-				"type":    anthropicErrorType(status),
-				"message": message,
-			},
-		}
-	} else {
-		payload = map[string]any{
-			"error": map[string]any{
-				"type":    openAIErrorType(status),
-				"message": message,
-			},
-		}
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return body
-	}
-	return data
-}
-
-func extractUpstreamErrorMessage(body []byte) string {
-	if len(body) == 0 {
-		return ""
-	}
-	var probe struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(body, &probe); err == nil {
-		if probe.Error.Message != "" {
-			return probe.Error.Message
-		}
-		if probe.Message != "" {
-			return probe.Message
-		}
-	}
-	return strings.TrimSpace(string(body))
-}
-
-func anthropicErrorType(status int) string {
-	switch status {
-	case http.StatusBadRequest:
-		return "invalid_request_error"
-	case http.StatusUnauthorized:
-		return "authentication_error"
-	case http.StatusForbidden:
-		return "permission_error"
-	case http.StatusNotFound:
-		return "not_found_error"
-	case http.StatusRequestEntityTooLarge:
-		return "request_too_large"
-	case http.StatusTooManyRequests:
-		return "rate_limit_error"
-	case 529:
-		return "overloaded_error"
-	default:
-		return "api_error"
-	}
-}
-
-func openAIErrorType(status int) string {
-	switch status {
-	case http.StatusBadRequest, http.StatusNotFound:
-		return "invalid_request_error"
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return "authentication_error"
-	case http.StatusTooManyRequests:
-		return "rate_limit_error"
-	default:
-		return "api_error"
-	}
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, typ, message string) {
