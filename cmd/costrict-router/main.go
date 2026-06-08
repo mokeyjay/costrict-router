@@ -362,6 +362,33 @@ func parseModelIDs(raw []byte) ([]string, error) {
 	return out, nil
 }
 
+// parseSourceModels 解析上游 /models 响应，提取生成 codex 目录所需的真实字段
+// （上下文窗口、图片能力）。字段名与上游一致：contextWindow / supportsImages。
+func parseSourceModels(raw []byte) ([]catalog.SourceModel, error) {
+	var payload struct {
+		Data []struct {
+			ID             string `json:"id"`
+			ContextWindow  int64  `json:"contextWindow"`
+			SupportsImages bool   `json:"supportsImages"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	out := make([]catalog.SourceModel, 0, len(payload.Data))
+	for _, m := range payload.Data {
+		if m.ID == "" {
+			continue
+		}
+		out = append(out, catalog.SourceModel{
+			ID:             m.ID,
+			ContextWindow:  m.ContextWindow,
+			SupportsImages: m.SupportsImages,
+		})
+	}
+	return out, nil
+}
+
 func containsModel(models []string, id string) bool {
 	for _, m := range models {
 		if m == id {
@@ -465,7 +492,7 @@ func cmdCodexCatalog(args []string) error {
 	if err != nil {
 		return err
 	}
-	models, err := parseModelIDs(raw)
+	models, err := parseSourceModels(raw)
 	if err != nil {
 		return err
 	}

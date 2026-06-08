@@ -7,12 +7,15 @@ import (
 )
 
 func TestBuild(t *testing.T) {
-	resp := Build([]string{"Auto", "Tencent-kimi-k2.6"})
+	resp := Build([]SourceModel{
+		{ID: "glm-5", ContextWindow: 198000, SupportsImages: false},
+		{ID: "kimi-k2.5", ContextWindow: 256000, SupportsImages: true},
+	})
 	if len(resp.Models) != 2 {
 		t.Fatalf("应生成 2 个模型, got=%d", len(resp.Models))
 	}
 	first := resp.Models[0]
-	if first.Slug != "Auto" || first.DisplayName != "Auto" {
+	if first.Slug != "glm-5" || first.DisplayName != "glm-5" {
 		t.Fatalf("slug/display_name 应为模型 ID, got slug=%q display=%q", first.Slug, first.DisplayName)
 	}
 	// visibility=list 才会出现在 codex /model 选择器里。
@@ -27,10 +30,30 @@ func TestBuild(t *testing.T) {
 	if resp.Models[0].Priority != 0 || resp.Models[1].Priority != 1 {
 		t.Fatalf("priority 应按序号递增, got=%d,%d", resp.Models[0].Priority, resp.Models[1].Priority)
 	}
+	// 上下文窗口取自上游真实值。
+	if first.ContextWindow != 198000 || first.MaxContextWindow != 198000 {
+		t.Fatalf("context_window 应为上游真实值 198000, got=%d/%d", first.ContextWindow, first.MaxContextWindow)
+	}
+	// 不支持图片：input_modalities 仅 text。
+	if len(first.InputModalities) != 1 || first.InputModalities[0] != "text" {
+		t.Fatalf("不支持图片应只有 text, got=%v", first.InputModalities)
+	}
+	// 支持图片：input_modalities 含 image。
+	if got := resp.Models[1].InputModalities; len(got) != 2 || got[1] != "image" {
+		t.Fatalf("支持图片应为 [text image], got=%v", got)
+	}
+}
+
+func TestBuildDefaultsContextWindow(t *testing.T) {
+	// 上游未提供上下文窗口（0）时回退到默认值。
+	resp := Build([]SourceModel{{ID: "x", ContextWindow: 0}})
+	if resp.Models[0].ContextWindow != defaultContextWindow {
+		t.Fatalf("缺省上下文窗口应回退到 %d, got=%d", defaultContextWindow, resp.Models[0].ContextWindow)
+	}
 }
 
 func TestMarshalIndented(t *testing.T) {
-	data, err := Build([]string{"Auto"}).MarshalIndented()
+	data, err := Build([]SourceModel{{ID: "Auto", ContextWindow: 100000}}).MarshalIndented()
 	if err != nil {
 		t.Fatalf("序列化失败: %v", err)
 	}

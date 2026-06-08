@@ -23,6 +23,16 @@ import (
 //go:embed codex_base_instructions.md
 var codexBaseInstructions string
 
+// defaultContextWindow 是上游未提供上下文窗口时的兜底值（与 codex 的 model_info_from_slug 一致）。
+const defaultContextWindow int64 = 272_000
+
+// SourceModel 是构建目录所需的单个上游模型信息（来自 CoStrict /models 接口）。
+type SourceModel struct {
+	ID             string // 模型 ID
+	ContextWindow  int64  // 上下文窗口；<=0 时使用默认值
+	SupportsImages bool   // 是否支持图片输入
+}
+
 // ModelsResponse 是 codex `model_catalog_json` 文件的顶层结构（对应 codex 的 ModelsResponse）。
 type ModelsResponse struct {
 	Models []ModelInfo `json:"models"`
@@ -58,14 +68,23 @@ type ModelInfo struct {
 	InputModalities               []string         `json:"input_modalities"`
 }
 
-// Build 把上游模型 ID 列表转成 codex model_catalog_json 期望的目录结构。
-// 每个模型的字段取值与 codex 的 model_info_from_slug 一致，priority 用列表序号以保持选择器顺序。
-func Build(ids []string) ModelsResponse {
-	models := make([]ModelInfo, 0, len(ids))
-	for i, id := range ids {
-		models = append(models, ModelInfo{
-			Slug:                          id,
-			DisplayName:                   id,
+// Build 把上游模型列表转成 codex model_catalog_json 期望的目录结构。
+// 上下文窗口与图片能力取自上游真实数据；其余字段镜像 codex 的 model_info_from_slug。
+// priority 用列表序号以保持选择器顺序。
+func Build(models []SourceModel) ModelsResponse {
+	out := make([]ModelInfo, 0, len(models))
+	for i, m := range models {
+		ctx := m.ContextWindow
+		if ctx <= 0 {
+			ctx = defaultContextWindow
+		}
+		modalities := []string{"text"}
+		if m.SupportsImages {
+			modalities = []string{"text", "image"}
+		}
+		out = append(out, ModelInfo{
+			Slug:                          m.ID,
+			DisplayName:                   m.ID,
 			SupportedReasoningLevels:      []struct{}{},
 			ShellType:                     "default",
 			Visibility:                    "list",
@@ -77,14 +96,14 @@ func Build(ids []string) ModelsResponse {
 			SupportVerbosity:              false,
 			TruncationPolicy:              TruncationPolicy{Mode: "bytes", Limit: 10_000},
 			SupportsParallelToolCalls:     false,
-			ContextWindow:                 272_000,
-			MaxContextWindow:              272_000,
+			ContextWindow:                 ctx,
+			MaxContextWindow:              ctx,
 			EffectiveContextWindowPercent: 95,
 			ExperimentalSupportedTools:    []string{},
-			InputModalities:               []string{"text", "image"},
+			InputModalities:               modalities,
 		})
 	}
-	return ModelsResponse{Models: models}
+	return ModelsResponse{Models: out}
 }
 
 // MarshalJSON 生成可写入文件的缩进 JSON（带末尾换行）。
