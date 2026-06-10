@@ -2,6 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -287,5 +292,63 @@ func TestAuthDisableEnableRoundTrip(t *testing.T) {
 	}
 	if got.AuthDisabled {
 		t.Fatal("enable 后 AuthDisabled 应为 false")
+	}
+}
+
+func TestSendChatProbeReturnsReply(t *testing.T) {
+	var gotPath, gotAuth, gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Model    string `json:"model"`
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.Unmarshal(body, &req)
+		gotModel = req.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"  你好，有什么可以帮你 "}}]}`))
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.BaseURL = srv.URL
+	cfg.AccessToken = "tok"
+	reply, err := sendChatProbe(context.Background(), cfg, "glm-5", "你好")
+	if err != nil {
+		t.Fatalf("sendChatProbe: %v", err)
+	}
+	if reply != "你好，有什么可以帮你" {
+		t.Fatalf("回复应去除首尾空白，得到: %q", reply)
+	}
+	if gotPath != "/chat-rag/api/v1/chat/completions" {
+		t.Fatalf("上游路径不对: %s", gotPath)
+	}
+	if gotAuth != "Bearer tok" {
+		t.Fatalf("Authorization 不对: %s", gotAuth)
+	}
+	if gotModel != "glm-5" {
+		t.Fatalf("model 不对: %s", gotModel)
+	}
+}
+
+func TestSendChatProbeReportsUpstreamError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"model not found"}}`))
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.BaseURL = srv.URL
+	_, err := sendChatProbe(context.Background(), cfg, "no-such", "你好")
+	if err == nil {
+		t.Fatal("非 2xx 应返回错误")
+	}
+	if !strings.Contains(err.Error(), "model not found") {
+		t.Fatalf("错误应包含上游响应内容，得到: %v", err)
 	}
 }

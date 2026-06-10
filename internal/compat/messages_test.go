@@ -67,6 +67,102 @@ func TestMessagesDecodeToolResultBecomesToolMessage(t *testing.T) {
 	}
 }
 
+// 回归：assistant 历史消息里的 thinking 块要映射成 reasoning_content，
+// 否则开启 thinking 的上游（如 kimi）会拒绝带 tool_calls 的消息。
+func TestMessagesDecodeThinkingBecomesReasoningContent(t *testing.T) {
+	body := `{
+		"model":"m","max_tokens":16,
+		"messages":[
+			{"role":"user","content":"read the file"},
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"let me call the tool"},
+				{"type":"tool_use","id":"toolu_1","name":"read","input":{"p":"a.txt"}}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
+		]
+	}`
+	chatBody, _, err := (MessagesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat chatRequest
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	// messages: user, assistant(tool_calls+reasoning), tool
+	var asst *chatMessage
+	for i := range chat.Messages {
+		if chat.Messages[i].Role == "assistant" {
+			asst = &chat.Messages[i]
+		}
+	}
+	if asst == nil {
+		t.Fatalf("缺少 assistant 消息: %s", chatBody)
+	}
+	if asst.ReasoningContent != "let me call the tool" {
+		t.Fatalf("reasoning_content 未映射: %+v", asst)
+	}
+	if len(asst.ToolCalls) != 1 || asst.ToolCalls[0].ID != "toolu_1" {
+		t.Fatalf("tool_calls 不对: %+v", asst)
+	}
+}
+
+// 回归：tool_result 里的 image 块要补成紧随其后的一条 user 消息，
+// 否则视觉模型收不到图片（Read 工具读图场景）。
+func TestMessagesDecodeToolResultImageBecomesFollowupUserMessage(t *testing.T) {
+	body := `{
+		"model":"m","max_tokens":16,
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"read","input":{}}]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"toolu_1","content":[
+					{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+				]}
+			]}
+		]
+	}`
+	chatBody, _, err := (MessagesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat chatRequest
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	// 期望: assistant(tool_calls), tool, user(image)
+	if len(chat.Messages) != 3 {
+		t.Fatalf("messages = %d: %s", len(chat.Messages), chatBody)
+	}
+	toolMsg := chat.Messages[1]
+	if toolMsg.Role != "tool" || toolMsg.ToolCallID != "toolu_1" {
+		t.Fatalf("tool 消息不对: %+v", toolMsg)
+	}
+	if s, _ := toolMsg.Content.(string); s == "" {
+		t.Fatalf("tool 消息内容不应为空: %+v", toolMsg)
+	}
+	userMsg := chat.Messages[2]
+	if userMsg.Role != "user" {
+		t.Fatalf("应补一条 user 消息承载图片: %+v", userMsg)
+	}
+	rawParts, err := json.Marshal(userMsg.Content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contentParts []chatContentPart
+	if err := json.Unmarshal(rawParts, &contentParts); err != nil {
+		t.Fatalf("user content 应为分片数组: %s", rawParts)
+	}
+	hasImage := false
+	for _, p := range contentParts {
+		if p.Type == "image_url" && p.ImageURL != nil && strings.HasPrefix(p.ImageURL.URL, "data:image/png;base64,") {
+			hasImage = true
+		}
+	}
+	if !hasImage {
+		t.Fatalf("补发的 user 消息缺少图片分片: %s", rawParts)
+	}
+}
+
 func TestMessagesEncodeResponse(t *testing.T) {
 	chat := `{"id":"chatcmpl-7","model":"glm-5","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi there"}}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`
 	out, err := (MessagesCodec{}).EncodeResponse([]byte(chat))

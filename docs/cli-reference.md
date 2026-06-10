@@ -12,6 +12,7 @@
 | `restart` | 重启后台服务 | `costrict-router restart` |
 | `logs` | 监看日志 | `costrict-router logs` |
 | `models` | 查看可用模型 | `costrict-router models` |
+| `test` | 真实发一条消息验证能否连通后端大模型 | `costrict-router test` |
 | `fallback` | 设置未知模型的兜底模型 | `costrict-router fallback` |
 | `codex-catalog` | 生成 codex 模型目录，让 CoStrict 模型出现在 codex `/model` 选择器 | `costrict-router codex-catalog` |
 | `key reset` | 重置本地 API Key | `costrict-router key reset` |
@@ -57,6 +58,23 @@
 | `-n` | 开始跟随前先显示最近 N 行 |
 | `--plain` | 去除 ANSI 高亮 |
 | `--log-file` | 指定日志文件 |
+
+### `test`
+
+刷新 token 后向上游真实发起一次非流式对话请求，验证当前实例能否连通后端大模型。可用位置参数指定模型名；不指定时按「兜底模型 → 第一个可用模型」自动选择。成功会打印模型回复，失败会打印上游返回的错误，便于区分配置/登录问题与上游模型不可用。
+
+```bash
+costrict-router test                  # 自动选模型，发送「你好」
+costrict-router test kimi-k2.5        # 指定模型
+costrict-router test --prompt "ping"  # 自定义测试消息
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `[model]` | 位置参数，要测试的模型名；省略则用兜底模型或第一个可用模型 |
+| `--prompt` | 发送的测试消息，默认 `你好` |
+| `--config` | 指定配置文件路径 |
+| `--timeout` | 请求超时时间，默认 `1m` |
 
 ### `codex-catalog`
 

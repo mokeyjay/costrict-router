@@ -173,6 +173,10 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 	var parts []chatContentPart
 	var toolCalls []chatToolCall
 	var textBuf strings.Builder
+	var thinkBuf strings.Builder
+	// tool_result 里的图片无法塞进 Chat 的 tool 角色消息（只能是字符串），
+	// 暂存到这里，循环结束后统一作为一条 user 消息补发给视觉模型。
+	var pendingToolImages []chatContentPart
 
 	flushUserAssistant := func() {
 		if m.Role == "assistant" {
@@ -182,6 +186,11 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 			msg := chatMessage{Role: "assistant"}
 			if textBuf.Len() > 0 {
 				msg.Content = textBuf.String()
+			}
+			// 回传 assistant 的思考内容：开启 thinking 的上游（如 kimi）要求带 tool_calls 的
+			// assistant 历史消息必须携带 reasoning_content，缺失会被拒绝（400 channel_error）。
+			if thinkBuf.Len() > 0 {
+				msg.ReasoningContent = thinkBuf.String()
 			}
 			msg.ToolCalls = toolCalls
 			out = append(out, msg)
@@ -193,6 +202,7 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 			}
 		}
 		textBuf.Reset()
+		thinkBuf.Reset()
 		parts = nil
 		toolCalls = nil
 	}
@@ -209,8 +219,14 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 			if url := anthropicImageToURL(b.Source); url != "" {
 				parts = append(parts, chatContentPart{Type: "image_url", ImageURL: &chatImageURL{URL: url}})
 			}
-		case "thinking", "redacted_thinking":
-			// 思考内容不回传给上游，避免污染对话。
+		case "thinking":
+			// 思考内容映射到 chat 的 reasoning_content（仅 assistant 回合有意义）：
+			// 开启 thinking 的上游要求 assistant tool_call 消息回传它，否则报错。
+			if m.Role == "assistant" {
+				thinkBuf.WriteString(b.Thinking)
+			}
+		case "redacted_thinking":
+			// 加密思考块无明文，无法回传，跳过。
 		case "tool_use":
 			args := string(b.Input)
 			if args == "" || args == "null" {
@@ -227,14 +243,26 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 		case "tool_result":
 			// tool_result 必须单独成为 tool 消息，先把已累积的内容刷出。
 			flushUserAssistant()
+			text, images := anthropicToolResultParts(b.Content)
+			if text == "" && len(images) > 0 {
+				// tool 消息内容不能为空，且图片要另发，这里放一句占位说明。
+				text = "[图片见后续消息]"
+			}
 			out = append(out, chatMessage{
 				Role:       "tool",
 				ToolCallID: b.ToolUseID,
-				Content:    anthropicToolResultText(b.Content),
+				Content:    text,
 			})
+			pendingToolImages = append(pendingToolImages, images...)
 		}
 	}
 	flushUserAssistant()
+	// 把 tool_result 里的图片补成一条 user 消息，紧跟在 tool 消息之后送给视觉模型。
+	if len(pendingToolImages) > 0 {
+		parts := []chatContentPart{{Type: "text", Text: "以下是上面工具调用返回的图片："}}
+		parts = append(parts, pendingToolImages...)
+		out = append(out, chatMessage{Role: "user", Content: parts})
+	}
 	return out, nil
 }
 
@@ -258,26 +286,34 @@ func anthropicImageToURL(src *anthropicSource) string {
 	return ""
 }
 
-// anthropicToolResultText 把 tool_result 的 content（字符串或块数组）压成纯文本。
-func anthropicToolResultText(raw json.RawMessage) string {
+// anthropicToolResultParts 拆分 tool_result 的 content（字符串或块数组），
+// 返回压平后的文本，以及其中携带的图片分片。Chat 的 tool 角色消息只能是字符串，
+// 图片需由调用方放到后续 user 消息里送给视觉模型。
+func anthropicToolResultParts(raw json.RawMessage) (string, []chatContentPart) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return ""
+		return "", nil
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
+		return s, nil
 	}
 	var blocks []anthropicBlock
 	if err := json.Unmarshal(raw, &blocks); err == nil {
 		var parts []string
+		var images []chatContentPart
 		for _, b := range blocks {
-			if b.Type == "text" {
+			switch b.Type {
+			case "text":
 				parts = append(parts, b.Text)
+			case "image":
+				if url := anthropicImageToURL(b.Source); url != "" {
+					images = append(images, chatContentPart{Type: "image_url", ImageURL: &chatImageURL{URL: url}})
+				}
 			}
 		}
-		return strings.Join(parts, "\n")
+		return strings.Join(parts, "\n"), images
 	}
-	return string(raw)
+	return string(raw), nil
 }
 
 func anthropicToolChoiceToChat(raw json.RawMessage) any {

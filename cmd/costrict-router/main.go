@@ -45,6 +45,8 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "models":
 		err = cmdModels(os.Args[2:])
+	case "test":
+		err = cmdTest(os.Args[2:])
 	case "fallback":
 		err = cmdFallback(os.Args[2:])
 	case "codex-catalog":
@@ -80,6 +82,7 @@ func usage() {
   costrict-router login --url <plugin-login-url>
   costrict-router serve [--addr 127.0.0.1:14567] [--debug] [--debug-full-request]
   costrict-router models [--json]
+  costrict-router test [model] [--prompt 你好]
   costrict-router fallback [model] [--clear]
   costrict-router codex-catalog [--codex-home ~/.codex] [--no-config]
   costrict-router start [--debug] [--debug-full-request]
@@ -94,6 +97,7 @@ func usage() {
   costrict-router login --url <plugin-login-url>
   costrict-router serve [--addr 127.0.0.1:14567] [--debug] [--debug-full-request]
   costrict-router models [--json]
+  costrict-router test [model] [--prompt 你好]
   costrict-router fallback [model] [--clear]
   costrict-router codex-catalog [--codex-home ~/.codex] [--no-config]
   costrict-router start [--debug] [--debug-full-request]
@@ -285,6 +289,161 @@ func cmdModels(args []string) error {
 		return nil
 	}
 	return printModels(raw)
+}
+
+// cmdTest 向上游真实发起一次对话请求，验证当前实例能否连通后端大模型。
+// 与浏览不同，它会刷新 token、按指定（或兜底/首个可用）模型 POST 一条消息并打印回复，
+// 帮助快速区分「配置/登录问题」和「上游模型不可用」。
+func cmdTest(args []string) error {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	configPath := fs.String("config", "", i18n.T("config file path", "配置文件路径"))
+	prompt := fs.String("prompt", "你好", i18n.T("message to send", "要发送的测试消息"))
+	timeout := fs.Duration("timeout", 60*time.Second, i18n.T("request timeout", "请求超时时间"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	// 先刷新 token，再用最新配置请求（与 models/fallback 一致）。
+	logger := logx.New(io.Discard, false)
+	svc := server.New(path, *cfg, logger)
+	if err := svc.EnsureFreshToken(context.Background()); err != nil {
+		return err
+	}
+	fresh := svc.Config()
+	if !fresh.LoggedIn() {
+		return fmt.Errorf(i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
+	}
+
+	// 模型名：命令行位置参数 > 兜底模型 > 第一个可用模型。
+	model := ""
+	if rest := fs.Args(); len(rest) > 0 {
+		model = rest[0]
+	}
+	if model == "" {
+		model = fresh.FallbackModel
+	}
+	if model == "" {
+		raw, err := fetchModels(context.Background(), fresh)
+		if err != nil {
+			return err
+		}
+		models, err := parseModelIDs(raw)
+		if err != nil {
+			return err
+		}
+		if len(models) == 0 {
+			return fmt.Errorf(i18n.T("upstream returned no available models", "上游未返回任何可用模型"))
+		}
+		model = models[0]
+	}
+
+	fmt.Printf(i18n.T("Testing model %q (sending %q)...\n", "正在测试模型 %q（发送 %q）...\n"), model, *prompt)
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	start := time.Now()
+	reply, err := sendChatProbe(ctx, fresh, model, *prompt)
+	elapsed := time.Since(start)
+	if err != nil {
+		fmt.Printf(i18n.T("❌ Connection failed (%.1fs): %v\n", "❌ 连通失败（耗时 %.1fs）: %v\n"), elapsed.Seconds(), err)
+		return err
+	}
+	fmt.Printf(i18n.T("✅ Connected (%.1fs); model replied:\n%s\n", "✅ 连通成功（耗时 %.1fs），模型回复:\n%s\n"), elapsed.Seconds(), reply)
+	return nil
+}
+
+// sendChatProbe 直接向上游 chat-rag 接口 POST 一条非流式消息，返回模型回复文本。
+// 头部与 proxy 转发时保持一致（认证、用户、追踪 ID），以尽量贴近真实链路。
+func sendChatProbe(ctx context.Context, cfg config.Config, model, prompt string) (string, error) {
+	upstreamURL, err := joinTestURL(cfg.BaseURL, "/chat-rag/api/v1/chat/completions")
+	if err != nil {
+		return "", err
+	}
+	reqBody, err := json.Marshal(map[string]any{
+		"model":    model,
+		"stream":   false,
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+	})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return "", err
+	}
+	requestID := ids.UUID()
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
+	req.Header.Set("User-Agent", "costrict-router/"+proxy.Version)
+	req.Header.Set("X-Request-ID", requestID)
+	req.Header.Set("zgsm-request-id", requestID)
+	req.Header.Set("zgsm-task-id", ids.UUID())
+	req.Header.Set("x-user-id", cfg.UserID)
+	req.Header.Set("zgsm-client-id", cfg.MachineCode)
+	req.Header.Set("zgsm-provider", "costrict")
+	req.Header.Set("x-caller", "chat")
+	req.Header.Set("x-quota-identity", "system")
+	req.Header.Set("X-Costrict-Version", cfg.PluginVersion)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf(i18n.T("unexpected upstream response: %s", "上游返回了非预期内容: %s"), strings.TrimSpace(string(body)))
+	}
+	if payload.Error != nil && payload.Error.Message != "" {
+		return "", fmt.Errorf("%s", payload.Error.Message)
+	}
+	if len(payload.Choices) == 0 {
+		return "", fmt.Errorf(i18n.T("upstream returned no choices: %s", "上游未返回任何回复内容: %s"), strings.TrimSpace(string(body)))
+	}
+	reply := strings.TrimSpace(payload.Choices[0].Message.Content)
+	if reply == "" {
+		return "", fmt.Errorf(i18n.T("upstream returned an empty reply: %s", "上游返回了空回复: %s"), strings.TrimSpace(string(body)))
+	}
+	return reply, nil
+}
+
+// joinTestURL 拼接上游路径，复用 proxy 的校验逻辑（base_url 必须含 scheme 与 host）。
+func joinTestURL(base, path string) (string, error) {
+	u, err := url.Parse(strings.TrimRight(base, "/"))
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf(i18n.T("invalid base_url: %s", "base_url 无效: %s"), base)
+	}
+	u.Path = path
+	u.RawQuery = ""
+	return u.String(), nil
 }
 
 // cmdFallback 设置「未知模型兜底」：把上游不存在的模型名统一替换成用户选定的模型，
