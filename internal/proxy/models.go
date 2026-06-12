@@ -6,12 +6,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"costrict-router/internal/config"
 	"costrict-router/internal/i18n"
 )
+
+// claudeModelPrefix 是给 Claude Code 的模型别名前缀。Claude Code 的 gatewayDiscovery 只把
+// id 以 claude/anthropic 开头的模型加入 /model 选择器，所以对它返回的 /v1/models 会给每个
+// 上游模型加上该前缀；入站请求再按需把前缀剥掉还原成真实上游模型名。
+const claudeModelPrefix = "claude-"
 
 // ModelResolver 缓存上游可用模型列表，把未知模型名映射到第一个可用模型。
 //
@@ -59,6 +65,21 @@ func (m *ModelResolver) Resolve(requested, preferredFallback string) (string, bo
 		return requested, false
 	}
 	return fallback, true
+}
+
+// stripClaudeAlias 把 Claude Code 的 claude- 别名前缀还原成真实上游模型名：
+// 仅当去掉前缀后确实是已知上游模型时才剥离，否则原样返回（保留真正的 claude-* 名走兜底）。
+func (m *ModelResolver) stripClaudeAlias(requested string) string {
+	if !strings.HasPrefix(requested, claudeModelPrefix) {
+		return requested
+	}
+	stripped := strings.TrimPrefix(requested, claudeModelPrefix)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.known[stripped]; ok {
+		return stripped
+	}
+	return requested
 }
 
 // shouldFetch 判断是否需要刷新缓存：未加载时按 retry 间隔重试，已加载时按 ttl 过期刷新。
@@ -156,8 +177,9 @@ func (h *Handler) fetchModelIDs(ctx context.Context, cfg config.Config) ([]strin
 	return ids, nil
 }
 
-// applyModelSubstitution 若请求体里的模型名未知，则替换为兜底模型（用户配置的 preferredFallback
-// 或第一个可用模型），并在 debug 下记录。返回（可能改写后的）请求体；解析失败或无需替换时原样返回。
+// applyModelSubstitution 规整请求体里的模型名：先把 Claude Code 的 claude- 别名还原成真实
+// 上游模型，再对仍未知的模型名替换为兜底模型（用户配置的 preferredFallback 或第一个可用模型），
+// 并在 debug 下记录。返回（可能改写后的）请求体；解析失败或无需改写时原样返回。
 func (h *Handler) applyModelSubstitution(body []byte, preferredFallback string) []byte {
 	if h.Models == nil {
 		return body
@@ -168,8 +190,10 @@ func (h *Handler) applyModelSubstitution(body []byte, preferredFallback string) 
 	if err := json.Unmarshal(body, &probe); err != nil || probe.Model == "" {
 		return body
 	}
-	resolved, changed := h.Models.Resolve(probe.Model, preferredFallback)
-	if !changed {
+	// 先剥别名前缀（仅当还原后是真实上游模型），再做兜底解析。
+	requested := h.Models.stripClaudeAlias(probe.Model)
+	resolved, _ := h.Models.Resolve(requested, preferredFallback)
+	if resolved == probe.Model {
 		return body
 	}
 	out, err := replaceJSONModel(body, resolved)
@@ -177,9 +201,58 @@ func (h *Handler) applyModelSubstitution(body []byte, preferredFallback string) 
 		return body
 	}
 	if h.Logger != nil && h.Logger.DebugEnabled() {
-		h.Logger.Debugf(i18n.T("substituted unknown model %q -> %q", "未知模型已替换 %q -> %q"), probe.Model, resolved)
+		h.Logger.Debugf(i18n.T("resolved model %q -> %q", "模型已规整 %q -> %q"), probe.Model, resolved)
 	}
 	return out
+}
+
+// addClaudeModelAlias 改写上游 /v1/models 响应：给每个模型 id 加 claude- 前缀，并在缺省时
+// 用原始 id 补 display_name（Claude Code /model 选择器显示 display_name）。其它字段原样保留。
+// 返回改写后的响应体；解析失败时返回 (nil,false) 由调用方退回原始响应。
+func addClaudeModelAlias(body []byte) ([]byte, bool) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false
+	}
+	dataRaw, ok := payload["data"]
+	if !ok {
+		return nil, false
+	}
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(dataRaw, &items); err != nil {
+		return nil, false
+	}
+	for _, item := range items {
+		idRaw, ok := item["id"]
+		if !ok {
+			continue
+		}
+		var id string
+		if err := json.Unmarshal(idRaw, &id); err != nil || id == "" {
+			continue
+		}
+		if _, has := item["display_name"]; !has {
+			if dn, err := json.Marshal(id); err == nil {
+				item["display_name"] = dn
+			}
+		}
+		if newID, err := json.Marshal(claudeModelPrefix + id); err == nil {
+			item["id"] = newID
+		}
+	}
+	newData, err := json.Marshal(items)
+	if err != nil {
+		return nil, false
+	}
+	payload["data"] = newData
+	// 关闭 HTML 转义，避免模型名/描述里的 <、>、& 被转义。
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil {
+		return nil, false
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), true
 }
 
 // replaceJSONModel 仅替换顶层 model 字段，其它字段以 json.RawMessage 原样保留（不重新转义内容）。

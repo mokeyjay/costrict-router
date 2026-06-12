@@ -2,7 +2,7 @@
 
 本页是常见使用场景的合集。参考类文档已拆分到下面几篇：
 
-- [在 codex 中使用](./codex.md) —— 接入 codex、让模型进 `/model` 选择器
+- [在 codex 中使用](./codex.md) —— 接入 codex
 - [部署与构建](./deployment.md) —— 自行编译、Docker 镜像部署
 - [命令参考](./cli-reference.md) —— 全部命令、参数与日志调试
 - [配置与文件位置](./configuration.md) —— 配置文件、日志/PID 路径、环境变量
@@ -32,7 +32,7 @@ costrict-router restart
 
 ## 关闭本地鉴权
 
-默认情况下，所有 `/v1/*` 接口都要带本地 API Key。如果你在一个**可信、仅本机可访问**的环境里嫌每次配 key 麻烦，可以关闭鉴权——关闭后请求不带 token 或带空 token 都能直接调用。
+默认情况下，所有 `/v1/*` 接口都要带本地 API Key。如果你在一个**可信、仅本机可访问**的环境中或有特殊需求，可以关闭鉴权，关闭后请求不带 token 或带空 token 都能直接调用。
 
 ```bash
 costrict-router auth disable     # 高危操作，会要求输入 yes 二次确认

@@ -25,6 +25,7 @@ _单文件 • 跨平台 • 自动续期 • 多格式兼容_
 | ♻️ **Token 自动刷新** | 根据 JWT 过期时间提前刷新，无感使用 |
 | 🧭 **后台运行** | 支持 `start`、`stop`、`status`、`restart` |
 | 📚 **模型列表** | 查看当前账号可用模型、上下文窗口和图片能力 |
+| 🩺 **连通自检** | `test` 命令实际发一条消息，验证能否连通后端大模型 |
 
 > CoStrict 原生仅支持 Chat Completions，其不支持的 Responses / Messages 格式由本工具在本地转换
 
@@ -78,7 +79,7 @@ costrict-router start
 | API Key | 初次启动时输出的 `sk-costrict-...` |
 | Model | 使用 `costrict-router models` 查看 |
 
-> 💡 **使用 codex 的话**，需要额外配置 provider 并生成模型目录，详见 [在 codex 中使用](./docs/codex.md)。
+> 💡 如需使用 Claude Code 或 Codex 请见下方 **高级用法**
 
 > ⚠️ 如果你有特殊需要，本项目也支持 **[关闭本地鉴权](./docs/advanced-usage.md#关闭本地鉴权)**
 
@@ -128,7 +129,8 @@ kimi-k2.5    256000   32000       true   false
 
 ## 🧰 高级用法
 
-- [在 codex 中使用](./docs/codex.md) —— 接入 codex、让模型进 `/model` 选择器
+- [在 Claude Code 中使用](./docs/claude-code.md) —— 接入 Claude Code
+- [在 Codex 中使用](./docs/codex.md) —— 接入 codex
 - [高级用法](./docs/advanced-usage.md) —— 常见使用场景（换端口、手动指定兜底模型等）
 - [命令参考](./docs/cli-reference.md) —— 全部命令、参数与日志调试
 - [配置与文件位置](./docs/configuration.md) —— 配置文件、日志/PID 路径、环境变量

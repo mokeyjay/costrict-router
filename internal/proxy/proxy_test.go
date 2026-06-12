@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -317,6 +318,54 @@ func TestAuthDisabledBypassesLocalAPIKey(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("鉴权关闭时空 token 应放行, status=%d", rec.Code)
+	}
+}
+
+func TestModelsAliasOnlyForAnthropicClient(t *testing.T) {
+	newHandler := func() *Handler {
+		return &Handler{
+			Tokens: &fakeTokens{cfg: config.Config{
+				BaseURL:      "https://example.com",
+				AccessToken:  "access",
+				RefreshToken: "refresh",
+				AuthDisabled: true,
+			}},
+			Client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"data":[{"id":"Tencent-glm-5.1"}]}`)),
+				}, nil
+			})},
+		}
+	}
+
+	// Claude Code（带 anthropic-version 头）：id 应加 claude- 前缀并补 display_name。
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	rec := httptest.NewRecorder()
+	newHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"id":"claude-Tencent-glm-5.1"`) || !strings.Contains(rec.Body.String(), `"display_name":"Tencent-glm-5.1"`) {
+		t.Fatalf("Claude Code 应得到加前缀的列表: %s", rec.Body.String())
+	}
+	// Content-Length 必须与改写后 body 一致。
+	if cl := rec.Result().Header.Get("Content-Length"); cl != strconv.Itoa(len(rec.Body.Bytes())) {
+		t.Fatalf("Content-Length=%q 与实际 body 长度 %d 不一致", cl, len(rec.Body.Bytes()))
+	}
+
+	// 其它工具（无 anthropic-version、非 claude-code UA）：原样返回，不加前缀。
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req2.Header.Set("User-Agent", "codex/1.0")
+	rec2 := httptest.NewRecorder()
+	newHandler().ServeHTTP(rec2, req2)
+	if strings.Contains(rec2.Body.String(), "claude-") {
+		t.Fatalf("非 Claude 客户端不应被改写: %s", rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), `"id":"Tencent-glm-5.1"`) {
+		t.Fatalf("非 Claude 客户端应原样返回: %s", rec2.Body.String())
 	}
 }
 

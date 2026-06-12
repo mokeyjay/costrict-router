@@ -367,9 +367,14 @@ func sendChatProbe(ctx context.Context, cfg config.Config, model, prompt string)
 		return "", err
 	}
 	reqBody, err := json.Marshal(map[string]any{
-		"model":    model,
-		"stream":   false,
-		"messages": []map[string]string{{"role": "user", "content": prompt}},
+		"model":  model,
+		"stream": false,
+		// 必须带一条 system 消息：部分上游模型（如 kimi）在「非流式 + 只有一条 user 消息」时
+		// 会报 "text content is empty"，补一条 system 消息即可正常，对其它模型也无副作用。
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are a helpful assistant."},
+			{"role": "user", "content": prompt},
+		},
 	})
 	if err != nil {
 		return "", err

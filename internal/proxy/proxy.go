@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,7 +59,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !h.authorizeLocalAPIKey(w, r) {
 			return
 		}
-		h.forward(w, r, "/ai-gateway/api/v1/models", false)
+		h.handleModels(w, r)
 	default:
 		writeOpenAIError(w, http.StatusNotFound, "not_found", i18n.T("local route not found", "未找到本地路由"))
 	}
@@ -317,6 +318,76 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath s
 	if copyErr != nil && h.Logger != nil {
 		h.Logger.Warnf(i18n.T("failed to copy upstream response request_id=%s err=%v", "复制上游响应失败 request_id=%s err=%v"), requestID, copyErr)
 	}
+}
+
+// handleModels 转发 /v1/models 到上游模型列表接口。对 Claude Code 的请求（带 anthropic-version
+// 头或 claude-code/ UA）会给每个模型 id 加 claude- 前缀，使其能进入 Claude Code 的 /model 选择器；
+// 其它客户端（codex、OpenAI 风格工具）原样返回，互不影响。
+func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	if err := h.Tokens.EnsureFreshToken(r.Context()); err != nil {
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", err.Error())
+		return
+	}
+	cfg := h.Tokens.Config()
+	if !cfg.LoggedIn() {
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
+		return
+	}
+	upstreamURL, err := joinURL(cfg.BaseURL, "/ai-gateway/api/v1/models")
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "configuration_error", err.Error())
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL, nil)
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "proxy_error", err.Error())
+		return
+	}
+	copySelectedHeaders(req.Header, r.Header)
+	applyCostrictHeaders(req.Header, cfg, r)
+
+	requestID := req.Header.Get("X-Request-ID")
+	resp, err := h.httpClient().Do(req)
+	if err != nil {
+		if h.Logger != nil {
+			h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
+		}
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		return
+	}
+	// 仅对 Claude Code 改写模型列表，让上游模型出现在它的 /model 选择器。
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && isAnthropicClient(r) {
+		if rewritten, ok := addClaudeModelAlias(body); ok {
+			body = rewritten
+		}
+	}
+	copyResponseHeaders(w.Header(), resp.Header)
+	// body 可能被改写，Content-Length 必须按当前长度重设（覆盖上游可能带的旧值）。
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(resp.StatusCode)
+	if _, err := w.Write(body); err != nil && h.Logger != nil {
+		h.Logger.Warnf(i18n.T("failed to copy upstream response request_id=%s err=%v", "复制上游响应失败 request_id=%s err=%v"), requestID, err)
+	}
+	if h.Logger != nil && h.Logger.DebugEnabled() {
+		h.Logger.Debugf(i18n.T("forward response id=%s method=%s path=%s status=%d duration=%s", "转发响应 id=%s method=%s path=%s status=%d 总耗时=%s"),
+			requestID, r.Method, r.URL.Path, resp.StatusCode, time.Since(start))
+	}
+}
+
+// isAnthropicClient 判断请求是否来自 Anthropic 协议客户端（主要是 Claude Code）：
+// 携带 anthropic-version 头，或 User-Agent 以 claude-code/ 开头。codex / OpenAI 风格工具都不满足。
+func isAnthropicClient(r *http.Request) bool {
+	if r.Header.Get("anthropic-version") != "" {
+		return true
+	}
+	return strings.HasPrefix(r.Header.Get("User-Agent"), "claude-code/")
 }
 
 func (h *Handler) shouldInspectRequest(isChatCompletion bool) bool {
