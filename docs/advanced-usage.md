@@ -103,6 +103,8 @@ costrict-router status
 curl http://127.0.0.1:14567/healthz
 ```
 
+`/healthz` 只返回最小健康状态；需要查看脱敏后的详细运行状态时，请使用 `costrict-router status`，或带本地 API Key 请求 `/v1/status`。
+
 ## 停止后台服务
 
 ```bash

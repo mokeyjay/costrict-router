@@ -860,6 +860,10 @@ func cmdStart(args []string) error {
 	if running, _ := readDaemonState(*pidPath); running.PID > 0 {
 		// 已有 PID 时用健康检查确认真实存活，避免重复启动占用同一端口。
 		if health, err := fetchHealth(running.Addr); err == nil {
+			status := health
+			if detailed, err := fetchStatus(running.Addr, running.ShutdownToken); err == nil {
+				status = detailed
+			}
 			// 用户显式要求的监听地址与正在运行的不同：不能静默忽略，否则会误以为新地址已生效。
 			if explicitAddr != "" && explicitAddr != running.Addr {
 				return fmt.Errorf(i18n.T(
@@ -867,7 +871,7 @@ func cmdStart(args []string) error {
 					"服务已在 %s 上运行，但你请求的是 --addr=%s；请执行 `costrict-router restart --addr=%s` 应用新地址（或先 stop 再 start）"),
 					running.Addr, explicitAddr, explicitAddr)
 			}
-			fmt.Printf(i18n.T("🟢 Service already running: http://%s/v1\n%s\n", "🟢 服务已在运行: http://%s/v1\n%s\n"), running.Addr, health)
+			fmt.Printf(i18n.T("🟢 Service already running: http://%s/v1\n%s\n", "🟢 服务已在运行: http://%s/v1\n%s\n"), running.Addr, status)
 			if cfg.LocalAPIKeyHash != "" {
 				fmt.Println(i18n.T("Local API Key is already configured; if you lost it, run: costrict-router key reset", "本地 API Key 已配置；如已遗失，请执行: costrict-router key reset"))
 			} else {
@@ -975,7 +979,7 @@ func cmdStop(args []string) error {
 }
 
 func cmdStatus(args []string) error {
-	// status 通过 PID 文件定位服务，再访问 healthz 输出脱敏后的运行状态。
+	// status 通过 PID 文件定位服务，再访问 /v1/status 输出脱敏后的运行状态。
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	pidPath := fs.String("pid-file", "", i18n.T("PID file path", "PID 文件路径"))
 	if err := fs.Parse(args); err != nil {
@@ -989,7 +993,7 @@ func cmdStatus(args []string) error {
 	if err != nil {
 		return err
 	}
-	health, err := fetchHealth(state.Addr)
+	health, err := fetchStatus(state.Addr, state.ShutdownToken)
 	if err != nil {
 		return fmt.Errorf(i18n.T("🔴 Service unavailable, PID=%d addr=%s: %w", "🔴 服务不可用，PID=%d addr=%s: %w"), state.PID, state.Addr, err)
 	}
@@ -1387,6 +1391,33 @@ func waitForHealth(addr string, timeout time.Duration) error {
 
 func fetchHealth(addr string) (string, error) {
 	resp, err := http.Get("http://" + addr + "/healthz")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("HTTP %d %s", resp.StatusCode, string(body))
+	}
+	var pretty bytes.Buffer
+	if json.Indent(&pretty, body, "", "  ") == nil {
+		return pretty.String(), nil
+	}
+	return string(body), nil
+}
+
+func fetchStatus(addr, statusToken string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/v1/status", nil)
+	if err != nil {
+		return "", err
+	}
+	if statusToken != "" {
+		req.Header.Set(server.ShutdownTokenHeader, statusToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}

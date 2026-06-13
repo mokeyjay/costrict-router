@@ -99,7 +99,8 @@ x-api-key: sk-costrict-...
 | `POST` | `/v1/responses` | OpenAI Responses 兼容入口，会转换为 Chat Completions 转发到上游 |
 | `POST` | `/v1/messages` | Anthropic Messages 兼容入口，会转换为 Chat Completions 转发到上游 |
 | `GET` | `/v1/models` | 查看当前账号可用模型 |
-| `GET` | `/healthz` | 本地服务健康检查 |
+| `GET` | `/v1/status` | 查看脱敏后的本地运行状态 |
+| `GET` | `/healthz` | 本地服务健康检查，仅返回健康状态 |
 
 `/v1/responses` 与 `/v1/messages` 是本地转换出来的兼容入口，日常的对话、图片、工具调用、流式输出都能正常使用。少数高级特性受上游能力限制，详见[兼容性与已知限制](./docs/compatibility.md)。
 

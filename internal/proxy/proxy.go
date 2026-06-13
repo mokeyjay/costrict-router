@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,6 +33,9 @@ type Handler struct {
 	Client           *http.Client
 	Logger           *logx.Logger
 	DebugFullRequest bool
+	// StatusToken 允许后台 CLI 通过 PID 文件中的本机 token 读取脱敏状态，
+	// 避免要求用户记住只显示一次的本地 API Key。
+	StatusToken string
 	// Models 把未知模型名替换为第一个可用模型；为 nil 时不做替换（原样透传）。
 	Models *ModelResolver
 }
@@ -40,6 +44,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
 		h.handleHealth(w)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+		if !h.authorizeStatus(w, r) {
+			return
+		}
+		h.handleStatus(w)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
 		if !h.authorizeLocalAPIKey(w, r) {
 			return
@@ -68,6 +77,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleHealth(w http.ResponseWriter) {
 	cfg := h.Tokens.Config()
 	payload := map[string]any{
+		"ok": cfg.LoggedIn(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func (h *Handler) handleStatus(w http.ResponseWriter) {
+	cfg := h.Tokens.Config()
+	payload := map[string]any{
 		"ok":                       cfg.LoggedIn(),
 		"base_url":                 config.Redact(cfg.BaseURL),
 		"listen_addr":              cfg.ListenAddr,
@@ -83,6 +101,22 @@ func (h *Handler) handleHealth(w http.ResponseWriter) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
+func (h *Handler) authorizeStatus(w http.ResponseWriter, r *http.Request) bool {
+	cfg := h.Tokens.Config()
+	if cfg.AuthDisabled || validLocalAPIKey(cfg, r) {
+		return true
+	}
+	if validStatusToken(h.StatusToken, r.Header.Get("X-Shutdown-Token")) {
+		return true
+	}
+	if cfg.LocalAPIKeyHash == "" {
+		writeOpenAIError(w, http.StatusInternalServerError, "configuration_error", i18n.T("local API key is not configured; restart costrict-router to generate one", "本地 API Key 未配置，请重启 costrict-router 生成"))
+		return false
+	}
+	writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("missing or invalid local API key", "缺少或提供了无效的本地 API Key"))
+	return false
+}
+
 func (h *Handler) authorizeLocalAPIKey(w http.ResponseWriter, r *http.Request) bool {
 	cfg := h.Tokens.Config()
 	if cfg.AuthDisabled {
@@ -93,11 +127,7 @@ func (h *Handler) authorizeLocalAPIKey(w http.ResponseWriter, r *http.Request) b
 		writeOpenAIError(w, http.StatusInternalServerError, "configuration_error", i18n.T("local API key is not configured; restart costrict-router to generate one", "本地 API Key 未配置，请重启 costrict-router 生成"))
 		return false
 	}
-	apiKey, ok := bearerToken(r.Header.Get("Authorization"))
-	if !ok || apiKey == "" {
-		// Anthropic 风格客户端用 x-api-key 鉴权，OpenAI 风格用 Authorization: Bearer，两者都接受。
-		apiKey = strings.TrimSpace(r.Header.Get("x-api-key"))
-	}
+	apiKey := localAPIKeyFromRequest(r)
 	if apiKey == "" {
 		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("missing local API key", "缺少本地 API Key"))
 		return false
@@ -107,6 +137,19 @@ func (h *Handler) authorizeLocalAPIKey(w http.ResponseWriter, r *http.Request) b
 		return false
 	}
 	return true
+}
+
+func validLocalAPIKey(cfg config.Config, r *http.Request) bool {
+	return cfg.LocalAPIKeyHash != "" && cfg.VerifyLocalAPIKey(localAPIKeyFromRequest(r))
+}
+
+func localAPIKeyFromRequest(r *http.Request) string {
+	apiKey, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok || apiKey == "" {
+		// Anthropic 风格客户端用 x-api-key 鉴权，OpenAI 风格用 Authorization: Bearer，两者都接受。
+		apiKey = strings.TrimSpace(r.Header.Get("x-api-key"))
+	}
+	return apiKey
 }
 
 // forwardCompat 处理需要协议转换的入口（/v1/responses、/v1/messages）：
@@ -523,6 +566,13 @@ func bearerToken(value string) (string, bool) {
 	}
 	token = strings.TrimSpace(token)
 	return token, token != ""
+}
+
+func validStatusToken(expected, got string) bool {
+	if expected == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }
 
 func (h *Handler) httpClient() *http.Client {

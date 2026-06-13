@@ -487,8 +487,8 @@ func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return fn(r)
 }
 
-func TestHealthzRedactsTokens(t *testing.T) {
-	// 健康检查响应必须脱敏 token 类字段，避免 status/logs 暴露敏感信息。
+func TestHealthzOnlyReturnsHealthState(t *testing.T) {
+	// 健康检查无鉴权，只能返回最小健康状态，避免暴露本地配置详情。
 	handler := &Handler{
 		Tokens: &fakeTokens{cfg: config.Config{
 			BaseURL:               "https://example.com",
@@ -508,12 +508,64 @@ func TestHealthzRedactsTokens(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(rec.Body.String(), "abcdefghijklmnopqrstuvwxyz") {
-		t.Fatalf("healthz leaked token-like value: %s", rec.Body.String())
+	if payload["ok"] != true || len(payload) != 1 {
+		t.Fatalf("healthz 应只返回 ok 字段: %s", rec.Body.String())
 	}
-	// base_url 也要脱敏，不能在 healthz（无鉴权）里暴露完整的私有上游地址。
+	if strings.Contains(rec.Body.String(), "abcdefghijklmnopqrstuvwxyz") || strings.Contains(rec.Body.String(), "https://example.com") {
+		t.Fatalf("healthz leaked detailed config: %s", rec.Body.String())
+	}
+}
+
+func TestStatusRedactsTokensAndRequiresAuth(t *testing.T) {
+	apiKey, apiKeyHash := localAPIKeyForTest(t)
+	handler := &Handler{
+		Tokens: &fakeTokens{cfg: config.Config{
+			BaseURL:               "https://example.com",
+			ListenAddr:            "127.0.0.1:14567",
+			AccessToken:           "abcdefghijklmnopqrstuvwxyz",
+			RefreshToken:          "refreshabcdefghijklmnopqrstuvwxyz",
+			LocalAPIKeyHash:       apiKeyHash,
+			MachineCode:           "machineabcdefghijklmnopqrstuvwxyz",
+			UserID:                "useridabcdefghijklmnopqrstuvwxyz",
+			AccessTokenExpiresAt:  time.Unix(1893456000, 0),
+			RefreshTokenExpiresAt: time.Unix(1893456000, 0),
+		}},
+		StatusToken: "shutdown-token",
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/status", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status without auth = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assertStatusPayloadRedacted(t, rec)
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	req.Header.Set("X-Shutdown-Token", "shutdown-token")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assertStatusPayloadRedacted(t, rec)
+}
+
+func assertStatusPayloadRedacted(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rec.Body.String(), "abcdefghijklmnopqrstuvwxyz") {
+		t.Fatalf("status leaked token-like value: %s", rec.Body.String())
+	}
 	if strings.Contains(rec.Body.String(), "https://example.com") {
-		t.Fatalf("healthz leaked full base_url: %s", rec.Body.String())
+		t.Fatalf("status leaked full base_url: %s", rec.Body.String())
 	}
 	if payload["local_api_key_configured"] != true {
 		t.Fatalf("local_api_key_configured = %v", payload["local_api_key_configured"])
