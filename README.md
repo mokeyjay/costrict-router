@@ -12,9 +12,9 @@ _单文件 • 跨平台 • 自动续期 • 多格式兼容_
 
 ---
 
-`costrict-router` 是一个第三方的 [CoStrict](https://github.com/zgsm-ai/costrict) 接口转发工具。它会在本地启动一个 OpenAI / Anthropic 兼容接口，将请求转发到你指定的 CoStrict 私有化服务端。
+`costrict-router` 是一个第三方的 [CoStrict](https://github.com/zgsm-ai/costrict) 接口转发工具。它会在本地启动一个 OpenAI / Anthropic 兼容服务，将请求转发到你指定的 CoStrict 私有化服务端
 
-你可以把它理解成一个 **本地 CoStrict 入口**：登录一次后，后续只需要把 Agent 工具的 Base URL 指向本地地址即可。
+简单来说就是可以让你通过 `Codex` `Claude Code` 之类的工具来调用 CoStrict 里面的模型
 
 ## ✨ 特性
 
@@ -24,7 +24,7 @@ _单文件 • 跨平台 • 自动续期 • 多格式兼容_
 | 🔐 **登录态持久化** | 生成 CoStrict 登录链接，登录成功后持久化 token 和本地配置 |
 | ♻️ **Token 自动刷新** | 根据 JWT 过期时间提前刷新，无感使用 |
 | 🧭 **后台运行** | 支持 `start`、`stop`、`status`、`restart` |
-| 📚 **模型列表** | 查看当前账号可用模型、上下文窗口和图片能力 |
+| 📚 **模型列表** | 查看当前账号可用模型、上下文窗口和视觉能力 |
 | 🩺 **连通自检** | `test` 命令实际发一条消息，验证能否连通后端大模型 |
 
 > CoStrict 原生仅支持 Chat Completions，其不支持的 Responses / Messages 格式由本工具在本地转换

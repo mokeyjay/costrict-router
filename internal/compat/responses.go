@@ -147,6 +147,14 @@ func responsesInputToChat(raw json.RawMessage) ([]chatMessage, error) {
 			}
 			if ok {
 				if msg.Role == "assistant" {
+					// 模型同一回合既输出文本又并行调用工具时，codex 会把 assistant 文本 item
+					// 排在 function_call 与其 function_call_output 之间。若另起一条 assistant 消息，
+					// 会夹在 tool_calls 与 tool 结果之间，破坏二者的紧邻关系（上游要求 tool 结果
+					// 紧跟 tool_calls，否则报 "tool_call 没有响应"）。这里并入同一条 assistant 消息。
+					if n := len(out); n > 0 && out[n-1].Role == "assistant" && len(out[n-1].ToolCalls) > 0 && out[n-1].Content == nil {
+						out[n-1].Content = msg.Content
+						break
+					}
 					msg.ReasoningContent = pendingReasoning
 				}
 				out = append(out, msg)

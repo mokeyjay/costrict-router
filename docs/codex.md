@@ -24,6 +24,29 @@ export COSTRICT_API_KEY=sk-costrict-...
 
 或者將它配置到 `.zshrc` 之类的文件中，避免每次手动设置
 
+### 不想影响到 OpenAI 官方服务或使用中转站时
+
+创建独立的配置目录和启动命令（例如 `codex-local`）可以使 Codex 指向本项目的同时不影响官方/中转站服务
+
+```bash
+mkdir -p ~/.codex-local
+cat > ~/.codex-local/config.toml <<'TOML'
+model_provider = "costrict-router"
+
+[model_providers.costrict-router]
+name = "CoStrict Router"
+base_url = "http://127.0.0.1:14567/v1"
+wire_api = "responses"
+env_key = "COSTRICT_API_KEY"
+TOML
+
+alias codex-local='CODEX_HOME=$HOME/.codex-local COSTRICT_API_KEY=sk-costrict-... codex'
+```
+
+之后 `codex-local` 指向本地 router，`codex` 仍走官方 OpenAI，互不干扰
+
+> 💡 想让 `codex-local` 的 `/model` 命令也能选择模型？执行 `costrict-router codex-catalog --codex-home ~/.codex-local`。
+
 ## 2. 让模型出现在 `/model` 选择器（可选）
 
 默认情况下，你在 codex 中只能看到 `gpt-*` 系列模型。如果你的 CoStrct 上游没有这个名字的模型，那本项目将会自动 fallback 到第一个可用的模型（也就是 `./costrict-router models` 命令返回的第一个模型）

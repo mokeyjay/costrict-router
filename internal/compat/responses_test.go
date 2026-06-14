@@ -400,3 +400,66 @@ func TestResponsesEncodeStreamToolCall(t *testing.T) {
 		}
 	}
 }
+
+// 回归:模型在同一回合既输出文本、又并行调用工具时,codex 会在 function_call 与其
+// function_call_output 之间插入一条 assistant message(文本)。转换后这条文本不能夹在
+// assistant(tool_calls) 与 tool 结果之间,否则上游报「tool_call 没有响应」。
+func TestResponsesAssistantTextBetweenToolCallsAndOutputs(t *testing.T) {
+	body := `{
+		"model":"m",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+			{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+			{"type":"function_call","call_id":"c2","name":"f","arguments":"{}"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"我来并行执行"}]},
+			{"type":"function_call_output","call_id":"c1","output":"r1"},
+			{"type":"function_call_output","call_id":"c2","output":"r2"}
+		]
+	}`
+	chatBody, _, err := (ResponsesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat struct {
+		Messages []struct {
+			Role      string `json:"role"`
+			Content   any    `json:"content"`
+			ToolCalls []struct {
+				ID string `json:"id"`
+			} `json:"tool_calls"`
+			ToolCallID string `json:"tool_call_id"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	// 同回合文本应并入 tool_calls 消息,而非另起一条 assistant。
+	for _, m := range chat.Messages {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			if s, _ := m.Content.(string); s != "我来并行执行" {
+				t.Fatalf("文本应并入 tool_calls 消息的 content,got=%v\n%s", m.Content, chatBody)
+			}
+		}
+	}
+	// 模拟上游严格校验:assistant(tool_calls) 之后、下一条 assistant 之前必须出现每个
+	// tool_call_id 的 tool 响应。
+	for i, m := range chat.Messages {
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			continue
+		}
+		responded := map[string]bool{}
+		for j := i + 1; j < len(chat.Messages); j++ {
+			if chat.Messages[j].Role == "assistant" {
+				break
+			}
+			if chat.Messages[j].Role == "tool" {
+				responded[chat.Messages[j].ToolCallID] = true
+			}
+		}
+		for _, tc := range m.ToolCalls {
+			if !responded[tc.ID] {
+				t.Fatalf("tool_call %q 没有配对的 tool 响应;转换结果:\n%s", tc.ID, chatBody)
+			}
+		}
+	}
+}
