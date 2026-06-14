@@ -3,15 +3,18 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
+	"costrict-router/internal/compat"
 	"costrict-router/internal/config"
 	"costrict-router/internal/i18n"
 	"costrict-router/internal/ids"
@@ -30,22 +33,42 @@ type Handler struct {
 	Client           *http.Client
 	Logger           *logx.Logger
 	DebugFullRequest bool
+	// StatusToken 允许后台 CLI 通过 PID 文件中的本机 token 读取脱敏状态，
+	// 避免要求用户记住只显示一次的本地 API Key。
+	StatusToken string
+	// Models 把未知模型名替换为第一个可用模型；为 nil 时不做替换（原样透传）。
+	Models *ModelResolver
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
 		h.handleHealth(w)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+		if !h.authorizeStatus(w, r) {
+			return
+		}
+		h.handleStatus(w)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
 		if !h.authorizeLocalAPIKey(w, r) {
 			return
 		}
 		h.forward(w, r, "/chat-rag/api/v1/chat/completions", true)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
+		if !h.authorizeLocalAPIKey(w, r) {
+			return
+		}
+		h.forwardCompat(w, r, compat.ResponsesCodec{})
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
+		if !h.authorizeLocalAPIKey(w, r) {
+			return
+		}
+		h.forwardCompat(w, r, compat.MessagesCodec{})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		if !h.authorizeLocalAPIKey(w, r) {
 			return
 		}
-		h.forward(w, r, "/ai-gateway/api/v1/models", false)
+		h.handleModels(w, r)
 	default:
 		writeOpenAIError(w, http.StatusNotFound, "not_found", i18n.T("local route not found", "未找到本地路由"))
 	}
@@ -54,28 +77,58 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleHealth(w http.ResponseWriter) {
 	cfg := h.Tokens.Config()
 	payload := map[string]any{
-		"ok":                       cfg.LoggedIn(),
-		"base_url":                 cfg.BaseURL,
-		"listen_addr":              cfg.ListenAddr,
-		"machine_code":             config.Redact(cfg.MachineCode),
-		"user_id":                  cfg.UserID,
-		"access_token":             config.Redact(cfg.AccessToken),
-		"refresh_token":            config.Redact(cfg.RefreshToken),
-		"access_expires":           cfg.AccessTokenExpiresAt,
-		"local_api_key_configured": cfg.LocalAPIKeyHash != "",
+		"ok": cfg.LoggedIn(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func (h *Handler) authorizeLocalAPIKey(w http.ResponseWriter, r *http.Request) bool {
+func (h *Handler) handleStatus(w http.ResponseWriter) {
 	cfg := h.Tokens.Config()
+	payload := map[string]any{
+		"ok":                       cfg.LoggedIn(),
+		"base_url":                 config.Redact(cfg.BaseURL),
+		"listen_addr":              cfg.ListenAddr,
+		"machine_code":             config.Redact(cfg.MachineCode),
+		"user_id":                  config.Redact(cfg.UserID),
+		"access_token":             config.Redact(cfg.AccessToken),
+		"refresh_token":            config.Redact(cfg.RefreshToken),
+		"access_expires":           cfg.AccessTokenExpiresAt,
+		"local_api_key_configured": cfg.LocalAPIKeyHash != "",
+		"auth_disabled":            cfg.AuthDisabled,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func (h *Handler) authorizeStatus(w http.ResponseWriter, r *http.Request) bool {
+	cfg := h.Tokens.Config()
+	if cfg.AuthDisabled || validLocalAPIKey(cfg, r) {
+		return true
+	}
+	if validStatusToken(h.StatusToken, r.Header.Get("X-Shutdown-Token")) {
+		return true
+	}
 	if cfg.LocalAPIKeyHash == "" {
 		writeOpenAIError(w, http.StatusInternalServerError, "configuration_error", i18n.T("local API key is not configured; restart costrict-router to generate one", "本地 API Key 未配置，请重启 costrict-router 生成"))
 		return false
 	}
-	apiKey, ok := bearerToken(r.Header.Get("Authorization"))
-	if !ok || apiKey == "" {
+	writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("missing or invalid local API key", "缺少或提供了无效的本地 API Key"))
+	return false
+}
+
+func (h *Handler) authorizeLocalAPIKey(w http.ResponseWriter, r *http.Request) bool {
+	cfg := h.Tokens.Config()
+	if cfg.AuthDisabled {
+		// 鉴权已被显式关闭：不校验本地 API Key，无 token 或空 token 均放行。
+		return true
+	}
+	if cfg.LocalAPIKeyHash == "" {
+		writeOpenAIError(w, http.StatusInternalServerError, "configuration_error", i18n.T("local API key is not configured; restart costrict-router to generate one", "本地 API Key 未配置，请重启 costrict-router 生成"))
+		return false
+	}
+	apiKey := localAPIKeyFromRequest(r)
+	if apiKey == "" {
 		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("missing local API key", "缺少本地 API Key"))
 		return false
 	}
@@ -84,6 +137,138 @@ func (h *Handler) authorizeLocalAPIKey(w http.ResponseWriter, r *http.Request) b
 		return false
 	}
 	return true
+}
+
+func validLocalAPIKey(cfg config.Config, r *http.Request) bool {
+	return cfg.LocalAPIKeyHash != "" && cfg.VerifyLocalAPIKey(localAPIKeyFromRequest(r))
+}
+
+func localAPIKeyFromRequest(r *http.Request) string {
+	apiKey, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok || apiKey == "" {
+		// Anthropic 风格客户端用 x-api-key 鉴权，OpenAI 风格用 Authorization: Bearer，两者都接受。
+		apiKey = strings.TrimSpace(r.Header.Get("x-api-key"))
+	}
+	return apiKey
+}
+
+// forwardCompat 处理需要协议转换的入口（/v1/responses、/v1/messages）：
+// 先把客户端请求体翻译成 Chat Completions，转发到上游，再把响应翻译回客户端协议。
+func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec compat.Codec) {
+	start := time.Now()
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	chatBody, stream, err := codec.DecodeRequest(bodyBytes)
+	if err != nil {
+		if apiErr := compat.AsAPIError(err); apiErr != nil {
+			writeOpenAIError(w, apiErr.Status, apiErr.Type, apiErr.Message)
+			return
+		}
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	if err := h.Tokens.EnsureFreshToken(r.Context()); err != nil {
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", err.Error())
+		return
+	}
+	cfg := h.Tokens.Config()
+	if !cfg.LoggedIn() {
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
+		return
+	}
+
+	// 未知模型替换：codex 辅助功能（multi_agent/guardian/记忆）与 claude-code 会用上游不存在的
+	// 模型名，统一替换成兜底模型（用户配置的 fallback_model 或第一个可用模型），避免这些功能失败。
+	h.ensureModels(r.Context(), cfg)
+	chatBody = h.applyModelSubstitution(chatBody, cfg.FallbackModel)
+
+	upstreamURL, err := joinURL(cfg.BaseURL, "/chat-rag/api/v1/chat/completions")
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "configuration_error", err.Error())
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(chatBody))
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "proxy_error", err.Error())
+		return
+	}
+	copySelectedHeaders(req.Header, r.Header)
+	req.Header.Set("Content-Type", "application/json")
+	applyCostrictHeaders(req.Header, cfg, r)
+
+	requestID := req.Header.Get("X-Request-ID")
+	chatSummary := summarizeChatRequest(chatBody)
+	if h.Logger != nil && h.Logger.DebugEnabled() && h.DebugFullRequest {
+		h.Logger.Debugf("forward %s request id=%s method=%s path=%s upstream=%s headers=%v body=%q",
+			codec.Name(), requestID, r.Method, r.URL.Path, upstreamURL, logx.RedactHeader(req.Header), logx.TruncateBody(chatBody, 32*1024))
+	}
+
+	resp, err := h.httpClient().Do(req)
+	headersAt := time.Now()
+	if err != nil {
+		if h.Logger != nil {
+			h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
+		}
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	status := resp.StatusCode
+	outputFormat := responseFormat(resp.Header)
+	var responseBody io.Reader = resp.Body
+	switch {
+	case status >= 200 && status < 300 && stream && outputFormat == "sse":
+		responseBody = codec.EncodeStream(resp.Body, modelName(chatBody))
+		copyTransformedResponseHeaders(w.Header(), resp.Header, "text/event-stream")
+		outputFormat = "sse"
+	case status >= 200 && status < 300:
+		upstreamBody, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", readErr.Error())
+			return
+		}
+		converted, convertErr := codec.EncodeResponse(upstreamBody)
+		if convertErr != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "proxy_error", convertErr.Error())
+			return
+		}
+		responseBody = bytes.NewReader(converted)
+		copyTransformedResponseHeaders(w.Header(), resp.Header, "application/json")
+		outputFormat = "json"
+	default:
+		// 上游错误体是 OpenAI 形状，转换成目标协议的错误信封，避免客户端 SDK 解析失败。
+		upstreamBody, _ := io.ReadAll(resp.Body)
+		responseBody = bytes.NewReader(codec.EncodeError(status, upstreamBody))
+		copyTransformedResponseHeaders(w.Header(), resp.Header, "application/json")
+		outputFormat = "json"
+	}
+
+	var collector *responseMetricsCollector
+	if h.Logger != nil && h.Logger.DebugEnabled() {
+		collector = newResponseMetricsCollector(start, headersAt, outputFormat)
+		responseBody = collector.wrap(responseBody)
+	}
+	w.WriteHeader(status)
+	_, copyErr := copyAndFlush(w, responseBody)
+	if h.Logger != nil {
+		if h.Logger.DebugEnabled() {
+			if collector != nil {
+				h.logChatMetrics(requestID, r, status, start, chatSummary, collector.finish(), len(chatBody), copyErr)
+			}
+		} else if status >= 400 {
+			h.Logger.Warnf(i18n.T("upstream returned error method=%s path=%s status=%d request_id=%s duration=%s", "上游返回错误 method=%s path=%s status=%d request_id=%s duration=%s"),
+				r.Method, r.URL.Path, status, requestID, time.Since(start))
+		}
+	}
+	if copyErr != nil && h.Logger != nil {
+		h.Logger.Warnf(i18n.T("failed to copy upstream response request_id=%s err=%v", "复制上游响应失败 request_id=%s err=%v"), requestID, copyErr)
+	}
 }
 
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath string, isChatCompletion bool) {
@@ -112,9 +297,14 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath s
 	var body io.Reader = r.Body
 	var bodyBytes []byte
 	var chatSummary chatRequestSummary
-	if h.shouldInspectRequest(isChatCompletion) && r.Body != nil {
-		// debug 模式只解析请求摘要；完整请求体必须显式开启 debug-full-request。
+	// chat/completions 需读取 body 以替换未知模型；debug 模式也会读 body 用于摘要/日志。
+	needBody := r.Body != nil && ((isChatCompletion && h.Models != nil) || h.shouldInspectRequest(isChatCompletion))
+	if needBody {
 		bodyBytes, _ = io.ReadAll(r.Body)
+		if isChatCompletion && h.Models != nil {
+			h.ensureModels(r.Context(), cfg)
+			bodyBytes = h.applyModelSubstitution(bodyBytes, cfg.FallbackModel)
+		}
 		body = bytes.NewReader(bodyBytes)
 		if isChatCompletion {
 			chatSummary = summarizeChatRequest(bodyBytes)
@@ -171,6 +361,76 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath s
 	if copyErr != nil && h.Logger != nil {
 		h.Logger.Warnf(i18n.T("failed to copy upstream response request_id=%s err=%v", "复制上游响应失败 request_id=%s err=%v"), requestID, copyErr)
 	}
+}
+
+// handleModels 转发 /v1/models 到上游模型列表接口。对 Claude Code 的请求（带 anthropic-version
+// 头或 claude-code/ UA）会给每个模型 id 加 claude- 前缀，使其能进入 Claude Code 的 /model 选择器；
+// 其它客户端（codex、OpenAI 风格工具）原样返回，互不影响。
+func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	if err := h.Tokens.EnsureFreshToken(r.Context()); err != nil {
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", err.Error())
+		return
+	}
+	cfg := h.Tokens.Config()
+	if !cfg.LoggedIn() {
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
+		return
+	}
+	upstreamURL, err := joinURL(cfg.BaseURL, "/ai-gateway/api/v1/models")
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "configuration_error", err.Error())
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL, nil)
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "proxy_error", err.Error())
+		return
+	}
+	copySelectedHeaders(req.Header, r.Header)
+	applyCostrictHeaders(req.Header, cfg, r)
+
+	requestID := req.Header.Get("X-Request-ID")
+	resp, err := h.httpClient().Do(req)
+	if err != nil {
+		if h.Logger != nil {
+			h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
+		}
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		return
+	}
+	// 仅对 Claude Code 改写模型列表，让上游模型出现在它的 /model 选择器。
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && isAnthropicClient(r) {
+		if rewritten, ok := addClaudeModelAlias(body); ok {
+			body = rewritten
+		}
+	}
+	copyResponseHeaders(w.Header(), resp.Header)
+	// body 可能被改写，Content-Length 必须按当前长度重设（覆盖上游可能带的旧值）。
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(resp.StatusCode)
+	if _, err := w.Write(body); err != nil && h.Logger != nil {
+		h.Logger.Warnf(i18n.T("failed to copy upstream response request_id=%s err=%v", "复制上游响应失败 request_id=%s err=%v"), requestID, err)
+	}
+	if h.Logger != nil && h.Logger.DebugEnabled() {
+		h.Logger.Debugf(i18n.T("forward response id=%s method=%s path=%s status=%d duration=%s", "转发响应 id=%s method=%s path=%s status=%d 总耗时=%s"),
+			requestID, r.Method, r.URL.Path, resp.StatusCode, time.Since(start))
+	}
+}
+
+// isAnthropicClient 判断请求是否来自 Anthropic 协议客户端（主要是 Claude Code）：
+// 携带 anthropic-version 头，或 User-Agent 以 claude-code/ 开头。codex / OpenAI 风格工具都不满足。
+func isAnthropicClient(r *http.Request) bool {
+	if r.Header.Get("anthropic-version") != "" {
+		return true
+	}
+	return strings.HasPrefix(r.Header.Get("User-Agent"), "claude-code/")
 }
 
 func (h *Handler) shouldInspectRequest(isChatCompletion bool) bool {
@@ -250,6 +510,26 @@ func copyResponseHeaders(dst, src http.Header) {
 	}
 }
 
+func copyTransformedResponseHeaders(dst, src http.Header, contentType string) {
+	for key, values := range src {
+		if isHopByHop(key) || strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Content-Type") {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+	dst.Set("Content-Type", contentType)
+}
+
+func modelName(body []byte) string {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	return payload.Model
+}
+
 func isHopByHop(key string) bool {
 	switch strings.ToLower(key) {
 	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
@@ -286,6 +566,13 @@ func bearerToken(value string) (string, bool) {
 	}
 	token = strings.TrimSpace(token)
 	return token, token != ""
+}
+
+func validStatusToken(expected, got string) bool {
+	if expected == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }
 
 func (h *Handler) httpClient() *http.Client {

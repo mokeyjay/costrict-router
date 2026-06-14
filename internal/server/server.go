@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
@@ -115,7 +116,10 @@ func (s *Service) nextRefreshDelay() time.Duration {
 	return delay
 }
 
-func Run(ctx context.Context, configPath string, cfg config.Config, addr string, logger *logx.Logger, debugFullRequest bool) error {
+// ShutdownTokenHeader 是 /-/shutdown 鉴权头名；stop 命令从 PID 文件读取 token 后用它请求关停。
+const ShutdownTokenHeader = "X-Shutdown-Token"
+
+func Run(ctx context.Context, configPath string, cfg config.Config, addr string, logger *logx.Logger, debugFullRequest bool, shutdownToken string) error {
 	// 组装本地 HTTP 服务、代理 handler 和优雅关闭入口，是 serve/start 的公共运行核心。
 	if addr != "" {
 		cfg.ListenAddr = addr
@@ -131,6 +135,8 @@ func Run(ctx context.Context, configPath string, cfg config.Config, addr string,
 		Client:           &http.Client{},
 		Logger:           logger,
 		DebugFullRequest: debugFullRequest,
+		StatusToken:      shutdownToken,
+		Models:           proxy.NewModelResolver(),
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -139,6 +145,14 @@ func Run(ctx context.Context, configPath string, cfg config.Config, addr string,
 	mux.HandleFunc("/-/shutdown", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// 关停接口需鉴权：必须携带与本进程匹配的 shutdown token（从本地 0600 PID 文件读取）。
+		// 未配置 token（如前台 serve）时一律拒绝，避免出现无鉴权的关停入口。
+		if !validShutdownToken(shutdownToken, r.Header.Get(ShutdownTokenHeader)) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
 			return
 		}
 		if logger != nil {
@@ -173,4 +187,12 @@ func Run(ctx context.Context, configPath string, cfg config.Config, addr string,
 		}
 		return err
 	}
+}
+
+// validShutdownToken 用常量时间比较校验 shutdown token；expected 为空（未启用）时一律拒绝。
+func validShutdownToken(expected, got string) bool {
+	if expected == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }

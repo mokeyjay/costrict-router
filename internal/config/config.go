@@ -19,6 +19,7 @@ type Config struct {
 	Version               int       `json:"version"`
 	BaseURL               string    `json:"base_url"`
 	ListenAddr            string    `json:"listen_addr"`
+	FallbackModel         string    `json:"fallback_model,omitempty"`
 	MachineCode           string    `json:"machine_code"`
 	State                 string    `json:"state"`
 	Provider              string    `json:"provider"`
@@ -29,6 +30,7 @@ type Config struct {
 	RefreshToken          string    `json:"refresh_token"`
 	LocalAPIKeyHash       string    `json:"local_api_key_hash,omitempty"`
 	LocalAPIKeyCreatedAt  time.Time `json:"local_api_key_created_at,omitempty"`
+	AuthDisabled          bool      `json:"auth_disabled,omitempty"`
 	UserID                string    `json:"user_id"`
 	AccessTokenExpiresAt  time.Time `json:"access_token_expires_at,omitempty"`
 	RefreshTokenExpiresAt time.Time `json:"refresh_token_expires_at,omitempty"`

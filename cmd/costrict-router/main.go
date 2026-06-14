@@ -1,24 +1,28 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"costrict-router/internal/auth"
+	"costrict-router/internal/catalog"
 	"costrict-router/internal/config"
 	"costrict-router/internal/i18n"
 	"costrict-router/internal/ids"
@@ -41,6 +45,12 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "models":
 		err = cmdModels(os.Args[2:])
+	case "test":
+		err = cmdTest(os.Args[2:])
+	case "fallback":
+		err = cmdFallback(os.Args[2:])
+	case "codex-catalog":
+		err = cmdCodexCatalog(os.Args[2:])
 	case "start":
 		err = cmdStart(os.Args[2:])
 	case "stop":
@@ -53,6 +63,8 @@ func main() {
 		err = cmdLogs(os.Args[2:])
 	case "key":
 		err = cmdKey(os.Args[2:])
+	case "auth":
+		err = cmdAuth(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -70,22 +82,32 @@ func usage() {
   costrict-router login --url <plugin-login-url>
   costrict-router serve [--addr 127.0.0.1:14567] [--debug] [--debug-full-request]
   costrict-router models [--json]
+  costrict-router test [model] [--prompt 你好]
+  costrict-router fallback [model] [--clear]
+  costrict-router codex-catalog [--codex-home ~/.codex] [--no-config]
   costrict-router start [--debug] [--debug-full-request]
   costrict-router stop
   costrict-router status
   costrict-router restart
   costrict-router logs
-  costrict-router key reset`, `用法:
+  costrict-router key reset
+  costrict-router auth disable [--yes]
+  costrict-router auth enable`, `用法:
   costrict-router login --base-url https://example.com
   costrict-router login --url <plugin-login-url>
   costrict-router serve [--addr 127.0.0.1:14567] [--debug] [--debug-full-request]
   costrict-router models [--json]
+  costrict-router test [model] [--prompt 你好]
+  costrict-router fallback [model] [--clear]
+  costrict-router codex-catalog [--codex-home ~/.codex] [--no-config]
   costrict-router start [--debug] [--debug-full-request]
   costrict-router stop
   costrict-router status
   costrict-router restart
   costrict-router logs
-  costrict-router key reset`))
+  costrict-router key reset
+  costrict-router auth disable [--yes]
+  costrict-router auth enable`))
 }
 
 func cmdLogin(args []string) error {
@@ -137,7 +159,7 @@ func cmdLogin(args []string) error {
 			return err
 		}
 		fmt.Printf(i18n.T("Token imported, config file: %s\n", "已导入 token，配置文件: %s\n"), path)
-		fmt.Printf("base_url: %s\nuser_id: %s\naccess_token: %s\n", cfg.BaseURL, cfg.UserID, config.Redact(cfg.AccessToken))
+		fmt.Printf("base_url: %s\nuser_id: %s\naccess_token: %s\n", cfg.BaseURL, config.Redact(cfg.UserID), config.Redact(cfg.AccessToken))
 		return nil
 	}
 
@@ -181,7 +203,7 @@ func cmdLogin(args []string) error {
 	if err := cfg.Save(path); err != nil {
 		return err
 	}
-	fmt.Printf(i18n.T("Login succeeded, config file: %s\nuser_id: %s\naccess_token: %s\n", "登录成功，配置文件: %s\nuser_id: %s\naccess_token: %s\n"), path, cfg.UserID, config.Redact(cfg.AccessToken))
+	fmt.Printf(i18n.T("Login succeeded, config file: %s\nuser_id: %s\naccess_token: %s\n", "登录成功，配置文件: %s\nuser_id: %s\naccess_token: %s\n"), path, config.Redact(cfg.UserID), config.Redact(cfg.AccessToken))
 	return nil
 }
 
@@ -205,8 +227,10 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := ensureLocalAPIKey(path, cfg, os.Stdout); err != nil {
-		return err
+	if !cfg.AuthDisabled {
+		if _, err := ensureLocalAPIKey(path, cfg, os.Stdout); err != nil {
+			return err
+		}
 	}
 	debugEnabled := *debug || *debugFullRequest
 	logger, closeLogger, err := buildLogger(*logFile, debugEnabled)
@@ -215,6 +239,9 @@ func cmdServe(args []string) error {
 	}
 	defer closeLogger()
 	logger.Infof(i18n.T("Config file: %s", "配置文件: %s"), path)
+	if cfg.AuthDisabled {
+		logger.Warnf("%s", authDisabledWarning(firstNonEmpty(*addr, cfg.ListenAddr)))
+	}
 	if debugEnabled {
 		logger.Warnf(i18n.T("debug is enabled; chat metrics will be logged", "debug 已开启，将记录对话指标"))
 	}
@@ -223,7 +250,8 @@ func cmdServe(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return server.Run(ctx, path, *cfg, *addr, logger, *debugFullRequest)
+	// shutdown token 仅由 start 通过环境变量注入；前台 serve 无 token，则 /-/shutdown 一律拒绝（用 Ctrl+C 退出）。
+	return server.Run(ctx, path, *cfg, *addr, logger, *debugFullRequest, os.Getenv(envShutdownToken))
 }
 
 func cmdModels(args []string) error {
@@ -263,12 +291,530 @@ func cmdModels(args []string) error {
 	return printModels(raw)
 }
 
+// cmdTest 向上游真实发起一次对话请求，验证当前实例能否连通后端大模型。
+// 与浏览不同，它会刷新 token、按指定（或兜底/首个可用）模型 POST 一条消息并打印回复，
+// 帮助快速区分「配置/登录问题」和「上游模型不可用」。
+func cmdTest(args []string) error {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	configPath := fs.String("config", "", i18n.T("config file path", "配置文件路径"))
+	prompt := fs.String("prompt", "你好", i18n.T("message to send", "要发送的测试消息"))
+	timeout := fs.Duration("timeout", 60*time.Second, i18n.T("request timeout", "请求超时时间"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	// 先刷新 token，再用最新配置请求（与 models/fallback 一致）。
+	logger := logx.New(io.Discard, false)
+	svc := server.New(path, *cfg, logger)
+	if err := svc.EnsureFreshToken(context.Background()); err != nil {
+		return err
+	}
+	fresh := svc.Config()
+	if !fresh.LoggedIn() {
+		return fmt.Errorf(i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
+	}
+
+	// 模型名：命令行位置参数 > 兜底模型 > 第一个可用模型。
+	model := ""
+	if rest := fs.Args(); len(rest) > 0 {
+		model = rest[0]
+	}
+	if model == "" {
+		model = fresh.FallbackModel
+	}
+	if model == "" {
+		raw, err := fetchModels(context.Background(), fresh)
+		if err != nil {
+			return err
+		}
+		models, err := parseModelIDs(raw)
+		if err != nil {
+			return err
+		}
+		if len(models) == 0 {
+			return fmt.Errorf(i18n.T("upstream returned no available models", "上游未返回任何可用模型"))
+		}
+		model = models[0]
+	}
+
+	fmt.Printf(i18n.T("Testing model %q (sending %q)...\n", "正在测试模型 %q（发送 %q）...\n"), model, *prompt)
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	start := time.Now()
+	reply, err := sendChatProbe(ctx, fresh, model, *prompt)
+	elapsed := time.Since(start)
+	if err != nil {
+		fmt.Printf(i18n.T("❌ Connection failed (%.1fs): %v\n", "❌ 连通失败（耗时 %.1fs）: %v\n"), elapsed.Seconds(), err)
+		return err
+	}
+	fmt.Printf(i18n.T("✅ Connected (%.1fs); model replied:\n%s\n", "✅ 连通成功（耗时 %.1fs），模型回复:\n%s\n"), elapsed.Seconds(), reply)
+	return nil
+}
+
+// sendChatProbe 直接向上游 chat-rag 接口 POST 一条非流式消息，返回模型回复文本。
+// 头部与 proxy 转发时保持一致（认证、用户、追踪 ID），以尽量贴近真实链路。
+func sendChatProbe(ctx context.Context, cfg config.Config, model, prompt string) (string, error) {
+	upstreamURL, err := joinTestURL(cfg.BaseURL, "/chat-rag/api/v1/chat/completions")
+	if err != nil {
+		return "", err
+	}
+	reqBody, err := json.Marshal(map[string]any{
+		"model":  model,
+		"stream": false,
+		// 必须带一条 system 消息：部分上游模型（如 kimi）在「非流式 + 只有一条 user 消息」时
+		// 会报 "text content is empty"，补一条 system 消息即可正常，对其它模型也无副作用。
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are a helpful assistant."},
+			{"role": "user", "content": prompt},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return "", err
+	}
+	requestID := ids.UUID()
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
+	req.Header.Set("User-Agent", "costrict-router/"+proxy.Version)
+	req.Header.Set("X-Request-ID", requestID)
+	req.Header.Set("zgsm-request-id", requestID)
+	req.Header.Set("zgsm-task-id", ids.UUID())
+	req.Header.Set("x-user-id", cfg.UserID)
+	req.Header.Set("zgsm-client-id", cfg.MachineCode)
+	req.Header.Set("zgsm-provider", "costrict")
+	req.Header.Set("x-caller", "chat")
+	req.Header.Set("x-quota-identity", "system")
+	req.Header.Set("X-Costrict-Version", cfg.PluginVersion)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf(i18n.T("unexpected upstream response: %s", "上游返回了非预期内容: %s"), strings.TrimSpace(string(body)))
+	}
+	if payload.Error != nil && payload.Error.Message != "" {
+		return "", fmt.Errorf("%s", payload.Error.Message)
+	}
+	if len(payload.Choices) == 0 {
+		return "", fmt.Errorf(i18n.T("upstream returned no choices: %s", "上游未返回任何回复内容: %s"), strings.TrimSpace(string(body)))
+	}
+	reply := strings.TrimSpace(payload.Choices[0].Message.Content)
+	if reply == "" {
+		return "", fmt.Errorf(i18n.T("upstream returned an empty reply: %s", "上游返回了空回复: %s"), strings.TrimSpace(string(body)))
+	}
+	return reply, nil
+}
+
+// joinTestURL 拼接上游路径，复用 proxy 的校验逻辑（base_url 必须含 scheme 与 host）。
+func joinTestURL(base, path string) (string, error) {
+	u, err := url.Parse(strings.TrimRight(base, "/"))
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf(i18n.T("invalid base_url: %s", "base_url 无效: %s"), base)
+	}
+	u.Path = path
+	u.RawQuery = ""
+	return u.String(), nil
+}
+
+// cmdFallback 设置「未知模型兜底」：把上游不存在的模型名统一替换成用户选定的模型，
+// 解决 codex（multi-agent/guardian/记忆用 gpt-5.x）、claude-code（claude-*）等辅助功能因模型
+// 不存在而不可用的问题。无参数时进入交互式选择；带模型名则直接设置；--clear 清除。
+func cmdFallback(args []string) error {
+	fs := flag.NewFlagSet("fallback", flag.ContinueOnError)
+	configPath := fs.String("config", "", i18n.T("config file path", "配置文件路径"))
+	clear := fs.Bool("clear", false, i18n.T("clear the custom fallback and use the first available model", "清除自定义兜底模型，恢复为使用第一个可用模型"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	if *clear {
+		cfg.FallbackModel = ""
+		if err := cfg.Save(path); err != nil {
+			return err
+		}
+		fmt.Println(i18n.T("Cleared the custom fallback model; unknown models will use the first available model.", "已清除自定义兜底模型；未知模型将使用第一个可用模型。"))
+		printRestartHint(path)
+		return nil
+	}
+
+	// 选择/设置都需要可用模型列表：先刷新 token 再拉取。
+	logger := logx.New(io.Discard, false)
+	svc := server.New(path, *cfg, logger)
+	if err := svc.EnsureFreshToken(context.Background()); err != nil {
+		return err
+	}
+	fresh := svc.Config()
+	raw, err := fetchModels(context.Background(), fresh)
+	if err != nil {
+		return err
+	}
+	models, err := parseModelIDs(raw)
+	if err != nil {
+		return err
+	}
+	if len(models) == 0 {
+		return fmt.Errorf(i18n.T("upstream returned no available models", "上游未返回任何可用模型"))
+	}
+
+	// 直接指定模型名：costrict-router fallback <model>
+	if rest := fs.Args(); len(rest) > 0 {
+		chosen := rest[0]
+		if !containsModel(models, chosen) {
+			return fmt.Errorf(i18n.T("model %q is not in the available list; run `costrict-router models` to see options", "模型 %q 不在可用列表中；执行 `costrict-router models` 查看可选项"), chosen)
+		}
+		return saveFallback(path, cfg, chosen)
+	}
+
+	// 交互式选择。
+	printFallbackIntro(cfg.FallbackModel, models)
+	chosen, changed, err := promptFallbackSelection(os.Stdin, os.Stdout, models)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		fmt.Println(i18n.T("Kept the current setting; nothing changed.", "保持当前设置，未做修改。"))
+		return nil
+	}
+	return saveFallback(path, cfg, chosen)
+}
+
+func parseModelIDs(raw []byte) ([]string, error) {
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(payload.Data))
+	for _, m := range payload.Data {
+		if m.ID != "" {
+			out = append(out, m.ID)
+		}
+	}
+	return out, nil
+}
+
+// parseSourceModels 解析上游 /models 响应，提取生成 codex 目录所需的真实字段
+// （上下文窗口、图片能力）。字段名与上游一致：contextWindow / supportsImages。
+func parseSourceModels(raw []byte) ([]catalog.SourceModel, error) {
+	var payload struct {
+		Data []struct {
+			ID             string `json:"id"`
+			ContextWindow  int64  `json:"contextWindow"`
+			SupportsImages bool   `json:"supportsImages"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	out := make([]catalog.SourceModel, 0, len(payload.Data))
+	for _, m := range payload.Data {
+		if m.ID == "" {
+			continue
+		}
+		out = append(out, catalog.SourceModel{
+			ID:             m.ID,
+			ContextWindow:  m.ContextWindow,
+			SupportsImages: m.SupportsImages,
+		})
+	}
+	return out, nil
+}
+
+func containsModel(models []string, id string) bool {
+	for _, m := range models {
+		if m == id {
+			return true
+		}
+	}
+	return false
+}
+
+// printFallbackIntro 只列出当前兜底模型与实时拉取的可用模型，供选择，不输出额外说明。
+func printFallbackIntro(current string, models []string) {
+	cur := current
+	if cur == "" {
+		cur = i18n.T("(not set)", "（未设置）")
+	}
+	fmt.Printf(i18n.T("Current fallback model: %s\n\nAvailable models:\n", "当前兜底模型: %s\n\n可用模型:\n"), cur)
+	for i, id := range models {
+		fmt.Printf("  %d) %s\n", i+1, id)
+	}
+	fmt.Println()
+}
+
+// promptFallbackSelection 读取序号或模型名；空行/EOF 表示保持不变。无效输入时重试。
+func promptFallbackSelection(in io.Reader, out io.Writer, models []string) (chosen string, changed bool, err error) {
+	scanner := bufio.NewScanner(in)
+	for {
+		fmt.Fprint(out, i18n.T("Enter a number or model name (empty = keep current): ", "请输入序号或模型名（直接回车保持不变）: "))
+		if !scanner.Scan() {
+			return "", false, scanner.Err()
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			return "", false, nil
+		}
+		if n, convErr := strconv.Atoi(line); convErr == nil {
+			if n >= 1 && n <= len(models) {
+				return models[n-1], true, nil
+			}
+			fmt.Fprintf(out, i18n.T("Number out of range (1-%d); try again.\n", "序号超出范围（1-%d），请重试。\n"), len(models))
+			continue
+		}
+		if containsModel(models, line) {
+			return line, true, nil
+		}
+		fmt.Fprintln(out, i18n.T("Not a valid number or model name; try again.", "不是有效的序号或模型名，请重试。"))
+	}
+}
+
+func saveFallback(path string, cfg *config.Config, model string) error {
+	cfg.FallbackModel = model
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+	fmt.Printf(i18n.T("Fallback model set to: %s\n", "兜底模型已设为: %s\n"), model)
+	printRestartHint(path)
+	return nil
+}
+
+func printRestartHint(path string) {
+	// 与 key reset 一致：服务在启动时加载配置，改动需重启后生效。
+	if pidPath, err := config.DefaultPIDPath(); err == nil {
+		if state, err := readDaemonState(pidPath); err == nil && state.ConfigPath == path {
+			fmt.Printf(i18n.T("A service using this config appears to be running at http://%s/v1; restart it for the change to take effect: costrict-router restart\n", "检测到使用该配置的服务可能在运行: http://%s/v1；请重启后生效: costrict-router restart\n"), state.Addr)
+			return
+		}
+	}
+	fmt.Println(i18n.T("Restart the service for the change to take effect.", "改动需重启服务后生效。"))
+}
+
+const codexCatalogFileName = "costrict-router-model-catalog.json"
+
+// cmdCodexCatalog 生成 codex 的 model_catalog_json 文件并（默认）改写 codex 的 config.toml 指向它。
+//
+// 用途：让上游第三方模型出现在 codex `/model` 选择器。codex 配了 model_catalog_json 后会改用
+// 静态目录（不再依赖网络 /models，也不需要 command-auth），直接显示文件里的模型。
+// 注意：这是静态快照，上游模型增减后需重新执行本命令；改动在下次启动 codex 时生效。
+func cmdCodexCatalog(args []string) error {
+	fs := flag.NewFlagSet("codex-catalog", flag.ContinueOnError)
+	configPath := fs.String("config", "", i18n.T("config file path", "配置文件路径"))
+	codexHome := fs.String("codex-home", "", i18n.T("codex home directory (default $CODEX_HOME or ~/.codex)", "codex 主目录（默认 $CODEX_HOME 或 ~/.codex）"))
+	noConfig := fs.Bool("no-config", false, i18n.T("only write the catalog file; do not modify codex config.toml", "只生成目录文件，不修改 codex config.toml"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	// 拉取上游可用模型列表：先刷新 token 再拉取（与 models/fallback 一致）。
+	logger := logx.New(io.Discard, false)
+	svc := server.New(path, *cfg, logger)
+	if err := svc.EnsureFreshToken(context.Background()); err != nil {
+		return err
+	}
+	raw, err := fetchModels(context.Background(), svc.Config())
+	if err != nil {
+		return err
+	}
+	models, err := parseSourceModels(raw)
+	if err != nil {
+		return err
+	}
+	if len(models) == 0 {
+		return fmt.Errorf(i18n.T("upstream returned no available models", "上游未返回任何可用模型"))
+	}
+
+	home, err := resolveCodexHome(*codexHome)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		return err
+	}
+	catalogPath := filepath.Join(home, codexCatalogFileName)
+	data, err := catalog.Build(models).MarshalIndented()
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(catalogPath, data, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf(i18n.T("✅ Wrote model catalog (%d models): %s\n", "✅ 已生成模型目录（%d 个模型）: %s\n"), len(models), catalogPath)
+
+	if *noConfig {
+		fmt.Printf(i18n.T("Add this to your codex config.toml to use it:\n  model_catalog_json = %q\n", "请把下面这行加到 codex config.toml 启用它:\n  model_catalog_json = %q\n"), catalogPath)
+		return nil
+	}
+
+	tomlPath := filepath.Join(home, "config.toml")
+	changed, err := setTOMLModelCatalogJSON(tomlPath, catalogPath)
+	if err != nil {
+		return err
+	}
+	if changed {
+		fmt.Printf(i18n.T("✅ Updated codex config: %s\n  model_catalog_json = %q\n", "✅ 已更新 codex 配置: %s\n  model_catalog_json = %q\n"), tomlPath, catalogPath)
+	} else {
+		fmt.Printf(i18n.T("codex config already points here: %s\n", "codex 配置已指向此文件: %s\n"), tomlPath)
+	}
+	fmt.Println(i18n.T("Restart codex (or start a new session) for the change to take effect.", "请重启 codex（或新开会话）后生效。"))
+	fmt.Println(i18n.T("Note: codex will then show ONLY these models in /model (its built-in gpt list is replaced); rerun this command after the upstream model list changes.", "注意：之后 codex /model 将只显示这些模型（自带 gpt 列表被替换）；上游模型变动后请重新执行本命令。"))
+	return nil
+}
+
+// resolveCodexHome 解析 codex 主目录：显式参数 > $CODEX_HOME > ~/.codex。
+func resolveCodexHome(explicit string) (string, error) {
+	if explicit != "" {
+		return expandHome(explicit)
+	}
+	if env := strings.TrimSpace(os.Getenv("CODEX_HOME")); env != "" {
+		return expandHome(env)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".codex"), nil
+}
+
+func expandHome(path string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, path[2:]), nil
+	}
+	return path, nil
+}
+
+// setTOMLModelCatalogJSON 在 codex config.toml 顶层设置（或更新）model_catalog_json。
+// 采用按行编辑，保留其余内容；顶层键必须位于第一个 [table] 之前，否则会归属该表。
+// 首次修改会保留一份 .bak 原始备份。返回是否发生了改动。
+func setTOMLModelCatalogJSON(tomlPath, catalogPath string) (bool, error) {
+	value := "model_catalog_json = " + tomlQuote(catalogPath)
+
+	original, err := os.ReadFile(tomlPath)
+	if os.IsNotExist(err) {
+		// 配置不存在：新建一个只含该键的 config.toml。
+		return true, os.WriteFile(tomlPath, []byte(value+"\n"), 0o644)
+	}
+	if err != nil {
+		return false, err
+	}
+
+	lines := strings.Split(string(original), "\n")
+	insertAt := len(lines) // 默认追加到末尾（无 table 时）
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			// 到达第一个 table 头：顶层键须插在它前面。
+			insertAt = i
+			break
+		}
+		if strings.HasPrefix(trimmed, "model_catalog_json") {
+			if after := strings.TrimSpace(trimmed[len("model_catalog_json"):]); strings.HasPrefix(after, "=") {
+				if line == value {
+					return false, nil // 已是目标值，无需改动
+				}
+				lines[i] = value // 原地替换
+				return true, writeTOML(tomlPath, original, lines)
+			}
+		}
+	}
+
+	// 未找到顶层键：插入到第一个 table 之前（或末尾）。
+	newLines := make([]string, 0, len(lines)+1)
+	newLines = append(newLines, lines[:insertAt]...)
+	newLines = append(newLines, value)
+	newLines = append(newLines, lines[insertAt:]...)
+	return true, writeTOML(tomlPath, original, newLines)
+}
+
+// writeTOML 写回 config.toml，首次修改时保留 .bak 原始备份。
+func writeTOML(tomlPath string, original []byte, lines []string) error {
+	bak := tomlPath + ".bak"
+	if _, err := os.Stat(bak); os.IsNotExist(err) {
+		if err := os.WriteFile(bak, original, 0o644); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(tomlPath, []byte(strings.Join(lines, "\n")), 0o644)
+}
+
+// tomlQuote 把字符串转成 TOML 基本字符串（转义反斜杠与双引号）。
+func tomlQuote(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
+}
+
+// envShutdownToken 用于把 start 生成的 shutdown token 传给后台 serve 子进程（避免出现在命令行 ps 中）。
+const envShutdownToken = "COSTRICT_ROUTER_SHUTDOWN_TOKEN"
+
 type daemonState struct {
 	PID        int       `json:"pid"`
 	Addr       string    `json:"addr"`
 	ConfigPath string    `json:"config_path"`
 	LogPath    string    `json:"log_path"`
 	StartedAt  time.Time `json:"started_at"`
+	// ShutdownToken 是本进程的关停凭证，随 PID 文件（0600）落盘，stop 读取后用它鉴权请求 /-/shutdown。
+	ShutdownToken string `json:"shutdown_token,omitempty"`
 }
 
 func cmdStart(args []string) error {
@@ -283,6 +829,8 @@ func cmdStart(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// 记录用户是否显式指定了 --addr，用于在已有服务监听地址不同步时给出明确提示。
+	explicitAddr := *addr
 	path, err := resolveConfigPath(*configPath)
 	if err != nil {
 		return err
@@ -293,6 +841,9 @@ func cmdStart(args []string) error {
 	}
 	if *addr == "" {
 		*addr = cfg.ListenAddr
+	}
+	if cfg.AuthDisabled {
+		fmt.Fprintln(os.Stderr, authDisabledWarning(*addr))
 	}
 	if *logPath == "" {
 		*logPath, err = config.DefaultLogPath()
@@ -309,7 +860,18 @@ func cmdStart(args []string) error {
 	if running, _ := readDaemonState(*pidPath); running.PID > 0 {
 		// 已有 PID 时用健康检查确认真实存活，避免重复启动占用同一端口。
 		if health, err := fetchHealth(running.Addr); err == nil {
-			fmt.Printf(i18n.T("🟢 Service already running: http://%s/v1\n%s\n", "🟢 服务已在运行: http://%s/v1\n%s\n"), running.Addr, health)
+			status := health
+			if detailed, err := fetchStatus(running.Addr, running.ShutdownToken); err == nil {
+				status = detailed
+			}
+			// 用户显式要求的监听地址与正在运行的不同：不能静默忽略，否则会误以为新地址已生效。
+			if explicitAddr != "" && explicitAddr != running.Addr {
+				return fmt.Errorf(i18n.T(
+					"a service is already running on %s, but you requested --addr=%s; run `costrict-router restart --addr=%s` to apply the new address (or stop it first)",
+					"服务已在 %s 上运行，但你请求的是 --addr=%s；请执行 `costrict-router restart --addr=%s` 应用新地址（或先 stop 再 start）"),
+					running.Addr, explicitAddr, explicitAddr)
+			}
+			fmt.Printf(i18n.T("🟢 Service already running: http://%s/v1\n%s\n", "🟢 服务已在运行: http://%s/v1\n%s\n"), running.Addr, status)
 			if cfg.LocalAPIKeyHash != "" {
 				fmt.Println(i18n.T("Local API Key is already configured; if you lost it, run: costrict-router key reset", "本地 API Key 已配置；如已遗失，请执行: costrict-router key reset"))
 			} else {
@@ -318,8 +880,10 @@ func cmdStart(args []string) error {
 			return nil
 		}
 	}
-	if _, err := ensureLocalAPIKey(path, cfg, os.Stdout); err != nil {
-		return err
+	if !cfg.AuthDisabled {
+		if _, err := ensureLocalAPIKey(path, cfg, os.Stdout); err != nil {
+			return err
+		}
 	}
 
 	exe, err := os.Executable()
@@ -341,19 +905,24 @@ func cmdStart(args []string) error {
 		return err
 	}
 	defer logFile.Close()
+	// 为本次后台进程生成一次性 shutdown token：通过环境变量传给子进程（不进命令行），
+	// 同时随 PID 文件落盘供 stop 读取，使 /-/shutdown 具备本机鉴权。
+	shutdownToken := ids.UUID()
 	cmd := exec.Command(exe, childArgs...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	cmd.Env = append(os.Environ(), envShutdownToken+"="+shutdownToken)
 	detachProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	state := daemonState{
-		PID:        cmd.Process.Pid,
-		Addr:       *addr,
-		ConfigPath: path,
-		LogPath:    *logPath,
-		StartedAt:  time.Now(),
+		PID:           cmd.Process.Pid,
+		Addr:          *addr,
+		ConfigPath:    path,
+		LogPath:       *logPath,
+		StartedAt:     time.Now(),
+		ShutdownToken: shutdownToken,
 	}
 	if err := writeDaemonState(*pidPath, state); err != nil {
 		_ = cmd.Process.Kill()
@@ -386,14 +955,17 @@ func cmdStop(args []string) error {
 	if err != nil {
 		return err
 	}
-	if state.Addr != "" {
+	if state.Addr != "" && state.ShutdownToken != "" {
 		req, _ := http.NewRequest(http.MethodPost, "http://"+state.Addr+"/-/shutdown", nil)
+		req.Header.Set(server.ShutdownTokenHeader, state.ShutdownToken)
 		resp, err := http.DefaultClient.Do(req)
 		if err == nil {
 			_ = resp.Body.Close()
-			_ = os.Remove(path)
-			fmt.Printf(i18n.T("🛑 Service stopped: %s\n", "🛑 服务已停止: %s\n"), state.Addr)
-			return nil
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				_ = os.Remove(path)
+				fmt.Printf(i18n.T("🛑 Service stopped: %s\n", "🛑 服务已停止: %s\n"), state.Addr)
+				return nil
+			}
 		}
 	}
 	if state.PID > 0 {
@@ -407,7 +979,7 @@ func cmdStop(args []string) error {
 }
 
 func cmdStatus(args []string) error {
-	// status 通过 PID 文件定位服务，再访问 healthz 输出脱敏后的运行状态。
+	// status 通过 PID 文件定位服务，再访问 /v1/status 输出脱敏后的运行状态。
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	pidPath := fs.String("pid-file", "", i18n.T("PID file path", "PID 文件路径"))
 	if err := fs.Parse(args); err != nil {
@@ -421,7 +993,7 @@ func cmdStatus(args []string) error {
 	if err != nil {
 		return err
 	}
-	health, err := fetchHealth(state.Addr)
+	health, err := fetchStatus(state.Addr, state.ShutdownToken)
 	if err != nil {
 		return fmt.Errorf(i18n.T("🔴 Service unavailable, PID=%d addr=%s: %w", "🔴 服务不可用，PID=%d addr=%s: %w"), state.PID, state.Addr, err)
 	}
@@ -529,7 +1101,7 @@ func cmdKeyReset(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf(i18n.T("Local API Key reset. Save it now; it will not be shown again:\n%s\n", "本地 API Key 已重置。请立即保存，它不会再次显示：\n%s\n"), apiKey)
+	fmt.Printf(i18n.T("Local API Key reset. Save it now; it will not be shown again:\n🔑 %s\n", "本地 API Key 已重置。请立即保存，它不会再次显示：\n🔑 %s\n"), apiKey)
 	fmt.Printf(i18n.T("Config file: %s\n", "配置文件: %s\n"), path)
 	if pidPath, err := config.DefaultPIDPath(); err == nil {
 		if state, err := readDaemonState(pidPath); err == nil && state.ConfigPath == path {
@@ -537,6 +1109,139 @@ func cmdKeyReset(args []string) error {
 		}
 	}
 	return nil
+}
+
+// authDisabledWarning 是关闭鉴权后 serve/start 时反复提示的安全警告文案。
+// 当监听地址不是回环地址（账号会暴露给网络）时追加一条更强的告警。
+func authDisabledWarning(listenAddr string) string {
+	msg := i18n.T(
+		"⚠️  authentication is DISABLED: any client that can reach the listen address can use your CoStrict account with no API key. Re-enable with `costrict-router auth enable`.",
+		"⚠️  鉴权已关闭：任何能访问监听地址的客户端无需 API Key 即可使用你的 CoStrict 账号。用 `costrict-router auth enable` 重新开启。",
+	)
+	if !isLoopbackListenAddr(listenAddr) {
+		msg += "\n" + fmt.Sprintf(i18n.T(
+			"🚨  listen address %q is NOT loopback — with auth disabled your account is exposed to the network. Bind to 127.0.0.1 or re-enable auth.",
+			"🚨  监听地址 %q 不是回环地址——在鉴权关闭的情况下你的账号会暴露给网络。请改绑 127.0.0.1，或重新开启鉴权。",
+		), listenAddr)
+	}
+	return msg
+}
+
+// isLoopbackListenAddr 判断监听地址是否仅限本机（回环）。无法解析或绑定到所有网卡时按非回环（更危险）处理。
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		host = strings.TrimSpace(addr)
+	}
+	if host == "" {
+		return false // 空 host = 绑定所有网卡
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false // 解析不了的主机名，保守地按非回环处理
+	}
+	return ip.IsLoopback()
+}
+
+func cmdAuth(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf(i18n.T("usage: costrict-router auth <disable|enable> [--config path] [--yes]", "用法: costrict-router auth <disable|enable> [--config path] [--yes]"))
+	}
+	switch args[0] {
+	case "disable":
+		return cmdAuthDisable(args[1:])
+	case "enable":
+		return cmdAuthEnable(args[1:])
+	default:
+		return fmt.Errorf(i18n.T("unknown auth command: %s", "未知 auth 命令: %s"), args[0])
+	}
+}
+
+// cmdAuthDisable 关闭本地鉴权（客户端无需 API Key 即可调用）。属高危操作，需二次确认。
+func cmdAuthDisable(args []string) error {
+	fs := flag.NewFlagSet("auth disable", flag.ContinueOnError)
+	configPath := fs.String("config", "", i18n.T("config file path", "配置文件路径"))
+	assumeYes := fs.Bool("yes", false, i18n.T("skip the confirmation prompt", "跳过二次确认"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+	if cfg.AuthDisabled {
+		fmt.Println(i18n.T("Authentication is already disabled.", "鉴权当前已是关闭状态。"))
+		return nil
+	}
+
+	// 二次确认：关闭鉴权风险较高，要求用户显式输入 yes。
+	fmt.Println(i18n.T("⚠️  Disabling authentication lets ANY client that can reach the listen address use your CoStrict account WITHOUT an API key.", "⚠️  关闭鉴权后，任何能访问监听地址的客户端都可以在【无需 API Key】的情况下使用你的 CoStrict 账号。"))
+	fmt.Println(i18n.T("   Only do this when the listen address is trusted and local-only.", "   请仅在监听地址可信、仅本机可访问时这样做。"))
+	if !isLoopbackListenAddr(cfg.ListenAddr) {
+		fmt.Printf(i18n.T("🚨  Your configured listen address %q is NOT loopback — disabling auth would expose your account to the network.\n", "🚨  你配置的监听地址 %q 不是回环地址——关闭鉴权会把账号暴露给网络。\n"), cfg.ListenAddr)
+	}
+	if !*assumeYes {
+		if !confirmYes(os.Stdin, os.Stdout, i18n.T("Type 'yes' to confirm: ", "输入 yes 确认关闭: ")) {
+			fmt.Println(i18n.T("Aborted; authentication unchanged.", "已取消，鉴权设置未改变。"))
+			return nil
+		}
+	}
+
+	cfg.AuthDisabled = true
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+	fmt.Println(i18n.T("🔓 Authentication disabled.", "🔓 鉴权已关闭。"))
+	printRestartHint(path)
+	return nil
+}
+
+// cmdAuthEnable 重新开启本地鉴权。
+func cmdAuthEnable(args []string) error {
+	fs := flag.NewFlagSet("auth enable", flag.ContinueOnError)
+	configPath := fs.String("config", "", i18n.T("config file path", "配置文件路径"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+	if !cfg.AuthDisabled {
+		fmt.Println(i18n.T("Authentication is already enabled.", "鉴权当前已是开启状态。"))
+		return nil
+	}
+	cfg.AuthDisabled = false
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+	fmt.Println(i18n.T("🔒 Authentication enabled.", "🔒 鉴权已开启。"))
+	if cfg.LocalAPIKeyHash == "" {
+		fmt.Println(i18n.T("No local API key is configured yet; one will be generated on the next start.", "尚未配置本地 API Key；下次 start 时会自动生成。"))
+	}
+	printRestartHint(path)
+	return nil
+}
+
+// confirmYes 打印提示并要求用户输入 yes（忽略大小写）才返回 true；EOF/空行视为否。
+func confirmYes(in io.Reader, out io.Writer, prompt string) bool {
+	fmt.Fprint(out, prompt)
+	scanner := bufio.NewScanner(in)
+	if !scanner.Scan() {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(scanner.Text()), "yes")
 }
 
 func fetchModels(ctx context.Context, cfg config.Config) ([]byte, error) {
@@ -615,7 +1320,7 @@ func ensureLocalAPIKey(path string, cfg *config.Config, out io.Writer) (string, 
 		return "", err
 	}
 	if out != nil {
-		fmt.Fprintf(out, i18n.T("Local API Key generated. Save it now; it will not be shown again:\n%s\n", "已生成本地 API Key。请立即保存，它不会再次显示：\n%s\n"), apiKey)
+		fmt.Fprintf(out, i18n.T("Local API Key generated. Save it now; it will not be shown again:\n🔑 %s\n", "已生成本地 API Key。请立即保存，它不会再次显示：\n🔑 %s\n"), apiKey)
 	}
 	return apiKey, nil
 }
@@ -686,6 +1391,33 @@ func waitForHealth(addr string, timeout time.Duration) error {
 
 func fetchHealth(addr string) (string, error) {
 	resp, err := http.Get("http://" + addr + "/healthz")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("HTTP %d %s", resp.StatusCode, string(body))
+	}
+	var pretty bytes.Buffer
+	if json.Indent(&pretty, body, "", "  ") == nil {
+		return pretty.String(), nil
+	}
+	return string(body), nil
+}
+
+func fetchStatus(addr, statusToken string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/v1/status", nil)
+	if err != nil {
+		return "", err
+	}
+	if statusToken != "" {
+		req.Header.Set(server.ShutdownTokenHeader, statusToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}

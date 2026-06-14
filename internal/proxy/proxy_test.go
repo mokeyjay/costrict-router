@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -66,6 +67,131 @@ func TestForwardChatAddsCostrictHeaders(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func testHandler(apiKeyHash string, client *http.Client) *Handler {
+	return &Handler{
+		Tokens: &fakeTokens{cfg: config.Config{
+			BaseURL:         "https://example.com",
+			AccessToken:     "access",
+			RefreshToken:    "refresh",
+			LocalAPIKeyHash: apiKeyHash,
+			MachineCode:     "machine",
+			UserID:          "user",
+		}},
+		Client: client,
+		Logger: logx.New(&strings.Builder{}, false),
+	}
+}
+
+func TestForwardResponsesConvertsThroughChatCompletions(t *testing.T) {
+	apiKey, apiKeyHash := localAPIKeyForTest(t)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/chat-rag/api/v1/chat/completions" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"messages"`) || !strings.Contains(string(body), `hello`) {
+			t.Fatalf("upstream body = %s", body)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"glm-5","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`)),
+		}, nil
+	})}
+	handler := testHandler(apiKeyHash, client)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"glm-5","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"object":"response"`) || !strings.Contains(rec.Body.String(), `"text":"hi"`) {
+		t.Fatalf("response body = %s", rec.Body.String())
+	}
+}
+
+func TestForwardAnthropicMessagesConvertsThroughChatCompletions(t *testing.T) {
+	apiKey, apiKeyHash := localAPIKeyForTest(t)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/chat-rag/api/v1/chat/completions" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"messages"`) || !strings.Contains(string(body), `hello`) {
+			t.Fatalf("upstream body = %s", body)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"glm-5","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}`)),
+		}, nil
+	})}
+	handler := testHandler(apiKeyHash, client)
+
+	// 使用 Anthropic 风格的 x-api-key 鉴权。
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"glm-5","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("x-api-key", apiKey)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"type":"message"`) || !strings.Contains(rec.Body.String(), `"text":"hi"`) {
+		t.Fatalf("response body = %s", rec.Body.String())
+	}
+}
+
+func TestResponsesRejectsMissingInput(t *testing.T) {
+	apiKey, apiKeyHash := localAPIKeyForTest(t)
+	called := false
+	handler := testHandler(apiKeyHash, &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		called = true
+		return nil, nil
+	})})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"glm-5","previous_response_id":"resp_1"}`))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if called {
+		t.Fatal("upstream was called for unsupported request")
+	}
+}
+
+func TestForwardCompatConvertsUpstreamErrorFormat(t *testing.T) {
+	apiKey, apiKeyHash := localAPIKeyForTest(t)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"slow down","type":"ai_model_error"}}`)),
+		}, nil
+	})}
+	handler := testHandler(apiKeyHash, client)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-api-key", apiKey)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var anthropicErr map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &anthropicErr); err != nil {
+		t.Fatal(err)
+	}
+	if anthropicErr["type"] != "error" {
+		t.Fatalf("messages error not anthropic-shaped: %s", rec.Body.String())
+	}
+	if anthropicErr["error"].(map[string]any)["type"] != "rate_limit_error" {
+		t.Fatalf("error type = %v", anthropicErr["error"])
 	}
 }
 
@@ -152,6 +278,94 @@ func TestModelsRequiresLocalAPIKey(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("upstream was not called with a valid local api key")
+	}
+}
+
+func TestAuthDisabledBypassesLocalAPIKey(t *testing.T) {
+	called := false
+	handler := &Handler{
+		Tokens: &fakeTokens{cfg: config.Config{
+			BaseURL:      "https://example.com",
+			AccessToken:  "access",
+			RefreshToken: "refresh",
+			// 鉴权已关闭：无 LocalAPIKeyHash、无 Authorization 头也应放行。
+			AuthDisabled: true,
+		}},
+		Client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			called = true
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"data":[]}`)),
+			}, nil
+		})},
+	}
+
+	// 不带任何 token 也能通过。
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("鉴权关闭时无 token 应放行, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !called {
+		t.Fatal("鉴权关闭时请求应转发到上游")
+	}
+
+	// 带空 token 也能通过。
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer ")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("鉴权关闭时空 token 应放行, status=%d", rec.Code)
+	}
+}
+
+func TestModelsAliasOnlyForAnthropicClient(t *testing.T) {
+	newHandler := func() *Handler {
+		return &Handler{
+			Tokens: &fakeTokens{cfg: config.Config{
+				BaseURL:      "https://example.com",
+				AccessToken:  "access",
+				RefreshToken: "refresh",
+				AuthDisabled: true,
+			}},
+			Client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"data":[{"id":"Tencent-glm-5.1"}]}`)),
+				}, nil
+			})},
+		}
+	}
+
+	// Claude Code（带 anthropic-version 头）：id 应加 claude- 前缀并补 display_name。
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	rec := httptest.NewRecorder()
+	newHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"id":"claude-Tencent-glm-5.1"`) || !strings.Contains(rec.Body.String(), `"display_name":"Tencent-glm-5.1"`) {
+		t.Fatalf("Claude Code 应得到加前缀的列表: %s", rec.Body.String())
+	}
+	// Content-Length 必须与改写后 body 一致。
+	if cl := rec.Result().Header.Get("Content-Length"); cl != strconv.Itoa(len(rec.Body.Bytes())) {
+		t.Fatalf("Content-Length=%q 与实际 body 长度 %d 不一致", cl, len(rec.Body.Bytes()))
+	}
+
+	// 其它工具（无 anthropic-version、非 claude-code UA）：原样返回，不加前缀。
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req2.Header.Set("User-Agent", "codex/1.0")
+	rec2 := httptest.NewRecorder()
+	newHandler().ServeHTTP(rec2, req2)
+	if strings.Contains(rec2.Body.String(), "claude-") {
+		t.Fatalf("非 Claude 客户端不应被改写: %s", rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), `"id":"Tencent-glm-5.1"`) {
+		t.Fatalf("非 Claude 客户端应原样返回: %s", rec2.Body.String())
 	}
 }
 
@@ -273,8 +487,8 @@ func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return fn(r)
 }
 
-func TestHealthzRedactsTokens(t *testing.T) {
-	// 健康检查响应必须脱敏 token 类字段，避免 status/logs 暴露敏感信息。
+func TestHealthzOnlyReturnsHealthState(t *testing.T) {
+	// 健康检查无鉴权，只能返回最小健康状态，避免暴露本地配置详情。
 	handler := &Handler{
 		Tokens: &fakeTokens{cfg: config.Config{
 			BaseURL:               "https://example.com",
@@ -283,6 +497,7 @@ func TestHealthzRedactsTokens(t *testing.T) {
 			RefreshToken:          "refreshabcdefghijklmnopqrstuvwxyz",
 			LocalAPIKeyHash:       "v1:sha256:salt:digest",
 			MachineCode:           "machineabcdefghijklmnopqrstuvwxyz",
+			UserID:                "useridabcdefghijklmnopqrstuvwxyz",
 			AccessTokenExpiresAt:  time.Unix(1893456000, 0),
 			RefreshTokenExpiresAt: time.Unix(1893456000, 0),
 		}},
@@ -293,8 +508,64 @@ func TestHealthzRedactsTokens(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
+	if payload["ok"] != true || len(payload) != 1 {
+		t.Fatalf("healthz 应只返回 ok 字段: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "abcdefghijklmnopqrstuvwxyz") || strings.Contains(rec.Body.String(), "https://example.com") {
+		t.Fatalf("healthz leaked detailed config: %s", rec.Body.String())
+	}
+}
+
+func TestStatusRedactsTokensAndRequiresAuth(t *testing.T) {
+	apiKey, apiKeyHash := localAPIKeyForTest(t)
+	handler := &Handler{
+		Tokens: &fakeTokens{cfg: config.Config{
+			BaseURL:               "https://example.com",
+			ListenAddr:            "127.0.0.1:14567",
+			AccessToken:           "abcdefghijklmnopqrstuvwxyz",
+			RefreshToken:          "refreshabcdefghijklmnopqrstuvwxyz",
+			LocalAPIKeyHash:       apiKeyHash,
+			MachineCode:           "machineabcdefghijklmnopqrstuvwxyz",
+			UserID:                "useridabcdefghijklmnopqrstuvwxyz",
+			AccessTokenExpiresAt:  time.Unix(1893456000, 0),
+			RefreshTokenExpiresAt: time.Unix(1893456000, 0),
+		}},
+		StatusToken: "shutdown-token",
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/status", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status without auth = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assertStatusPayloadRedacted(t, rec)
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	req.Header.Set("X-Shutdown-Token", "shutdown-token")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assertStatusPayloadRedacted(t, rec)
+}
+
+func assertStatusPayloadRedacted(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
 	if strings.Contains(rec.Body.String(), "abcdefghijklmnopqrstuvwxyz") {
-		t.Fatalf("healthz leaked token-like value: %s", rec.Body.String())
+		t.Fatalf("status leaked token-like value: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "https://example.com") {
+		t.Fatalf("status leaked full base_url: %s", rec.Body.String())
 	}
 	if payload["local_api_key_configured"] != true {
 		t.Fatalf("local_api_key_configured = %v", payload["local_api_key_configured"])

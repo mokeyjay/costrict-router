@@ -6,10 +6,12 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   test:
@@ -104,19 +106,121 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  release:
-    name: Publish Release
+  container:
+    name: Build and publish container image
     runs-on: ubuntu-latest
-    needs: build
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=v(.*),group=1
+
+      - name: Prepare Docker tags
+        id: docker-tags
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          VERSION: ${{ github.ref_name }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+
+          tags="${META_TAGS}"
+          if [[ "${VERSION#v}" != *-* ]]; then
+            tags="${tags}"$'\n'"${REGISTRY}/${IMAGE_NAME}:latest"
+          fi
+
+          {
+            echo "tags<<EOF"
+            echo "${tags}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push container image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.docker-tags.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - container
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - name: Download artifacts
         uses: actions/download-artifact@v7
         with:
+          pattern: release-assets-*
           path: dist
           merge-multiple: true
+
+      - name: Build release notes
+        env:
+          VERSION: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # 按提交历史找到上一个 tag，用于生成从上个版本到本次的提交列表
+          prev_tag="$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || true)"
+
+          {
+            echo "## 更新内容"
+            echo
+            if [ -n "${prev_tag}" ]; then
+              git log --no-merges --pretty=format:'- %s (%h)' "${prev_tag}..${VERSION}"
+              echo
+              echo
+              echo "**完整变更**: https://github.com/${REPO}/compare/${prev_tag}...${VERSION}"
+            else
+              # 首个版本：列出该 tag 之前的全部提交
+              git log --no-merges --pretty=format:'- %s (%h)' "${VERSION}"
+            fi
+            echo
+          } > release_notes.md
+
+          echo "----- 生成的 release notes -----"
+          cat release_notes.md
 
       - name: Create or update GitHub Release
         env:
@@ -125,10 +229,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          release_flags=()
+          if [[ "${VERSION#v}" == *-* ]]; then
+            release_flags+=(--prerelease --latest=false)
+          else
+            release_flags+=(--prerelease=false --latest)
+          fi
+
           if gh release view "${VERSION}" >/dev/null 2>&1; then
+            gh release edit "${VERSION}" \
+              --title "${VERSION}" \
+              --notes-file release_notes.md \
+              "${release_flags[@]}"
             gh release upload "${VERSION}" dist/* --clobber
           else
             gh release create "${VERSION}" dist/* \
               --title "${VERSION}" \
-              --notes "Release ${VERSION}"
+              --notes-file release_notes.md \
+              "${release_flags[@]}"
           fi
