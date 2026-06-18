@@ -12,6 +12,7 @@ import (
 
 	"costrict-router/internal/config"
 	"costrict-router/internal/i18n"
+	"costrict-router/internal/version"
 )
 
 // claudeModelPrefix 是给 Claude Code 的模型别名前缀。Claude Code 的 gatewayDiscovery 只把
@@ -151,7 +152,7 @@ func (h *Handler) fetchModelIDs(ctx context.Context, cfg config.Config) ([]strin
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
 	req.Header.Set("x-user-id", cfg.UserID)
-	req.Header.Set("User-Agent", "costrict-router/"+Version)
+	req.Header.Set("User-Agent", "costrict-router/"+version.Current)
 	resp, err := h.httpClient().Do(req)
 	if err != nil {
 		return nil, err

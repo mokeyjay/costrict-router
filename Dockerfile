@@ -13,11 +13,14 @@ COPY . .
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION=dev
 
 ENV CGO_ENABLED=0
 
 RUN GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
-    go build -trimpath -ldflags="-s -w" -o /out/costrict-router ./cmd/costrict-router
+    go build -trimpath \
+    -ldflags="-s -w -X costrict-router/internal/version.Current=${VERSION}" \
+    -o /out/costrict-router ./cmd/costrict-router
 
 FROM alpine:3.22
 

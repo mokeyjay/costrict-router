@@ -19,9 +19,8 @@ import (
 	"costrict-router/internal/i18n"
 	"costrict-router/internal/ids"
 	"costrict-router/internal/logx"
+	"costrict-router/internal/version"
 )
-
-const Version = "0.1.0"
 
 type TokenProvider interface {
 	Config() config.Config
@@ -479,7 +478,7 @@ func applyCostrictHeaders(h http.Header, cfg config.Config, incoming *http.Reque
 	h.Set("Accept-Language", firstHeader(incoming, "Accept-Language", "zh-CN"))
 	h.Set("HTTP-Referer", firstHeader(incoming, "HTTP-Referer", "https://github.com/RooVetGit/Roo-Cline"))
 	h.Set("X-Title", firstHeader(incoming, "X-Title", "Roo Code"))
-	h.Set("User-Agent", fmt.Sprintf("costrict-router/%s (%s/%s)", Version, runtime.GOOS, runtime.GOARCH))
+	h.Set("User-Agent", fmt.Sprintf("costrict-router/%s (%s/%s)", version.Current, runtime.GOOS, runtime.GOARCH))
 	h.Set("X-Costrict-Version", cfg.PluginVersion)
 	h.Set("x-quota-identity", firstHeader(incoming, "x-quota-identity", "system"))
 	h.Set("X-Request-ID", requestID)

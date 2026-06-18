@@ -64,7 +64,9 @@ for target in "${TARGETS[@]}"; do
 
     echo "==> 编译 ${asset_os}/${goarch}"
     CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
-        go build -trimpath -o "${package_dir}/${binary_name}" ./cmd/costrict-router
+        go build -trimpath \
+        -ldflags "-X costrict-router/internal/version.Current=${VERSION}" \
+        -o "${package_dir}/${binary_name}" ./cmd/costrict-router
 
     echo "==> 打包 ${package_name}.${archive}"
     if [[ "${archive}" == "zip" ]]; then
