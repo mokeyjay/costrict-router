@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"costrict-router/internal/config"
 )
@@ -332,6 +334,53 @@ func TestSendChatProbeReturnsReply(t *testing.T) {
 	}
 	if gotModel != "glm-5" {
 		t.Fatalf("model 不对: %s", gotModel)
+	}
+}
+
+func TestTestTargetFromArgs(t *testing.T) {
+	tests := []struct {
+		name       string
+		modelFlag  string
+		all        bool
+		positional []string
+		wantModel  string
+		wantAll    bool
+		wantErr    bool
+	}{
+		{name: "model flag", modelFlag: "glm-5", wantModel: "glm-5"},
+		{name: "legacy positional", positional: []string{"kimi-k2.5"}, wantModel: "kimi-k2.5"},
+		{name: "all flag", all: true, wantAll: true},
+		{name: "all positional", positional: []string{"all"}, wantAll: true},
+		{name: "automatic selection"},
+		{name: "duplicate model", modelFlag: "glm-5", positional: []string{"kimi-k2.5"}, wantErr: true},
+		{name: "all with model", all: true, modelFlag: "glm-5", wantErr: true},
+		{name: "too many positional arguments", positional: []string{"glm-5", "extra"}, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotModel, gotAll, err := testTargetFromArgs(test.modelFlag, test.all, test.positional)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("err = %v, wantErr = %t", err, test.wantErr)
+			}
+			if gotModel != test.wantModel || gotAll != test.wantAll {
+				t.Fatalf("model = %q, all = %t; want model = %q, all = %t", gotModel, gotAll, test.wantModel, test.wantAll)
+			}
+		})
+	}
+}
+
+func TestSortModelTestResults(t *testing.T) {
+	results := []modelTestResult{
+		{model: "slow", durations: []time.Duration{3 * time.Second, 4 * time.Second}},
+		{model: "partial", durations: []time.Duration{time.Second}, failures: 1},
+		{model: "fast", durations: []time.Duration{time.Second, 2 * time.Second}},
+	}
+	sortModelTestResults(results)
+	got := []string{results[0].model, results[1].model, results[2].model}
+	want := []string{"fast", "slow", "partial"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("order = %v, want %v", got, want)
 	}
 }
 

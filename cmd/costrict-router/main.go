@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -83,7 +84,8 @@ func usage() {
   costrict-router login --url <plugin-login-url>
   costrict-router serve [--addr 127.0.0.1:14567] [--debug] [--debug-full-request]
   costrict-router models [--json]
-  costrict-router test [model] [--prompt 你好]
+  costrict-router test [--model name] [--prompt 你好]
+  costrict-router test all [--runs 3] [--prompt "只回复 OK"]
   costrict-router fallback [model] [--clear]
   costrict-router codex-catalog [--codex-home ~/.codex] [--no-config]
   costrict-router start [--debug] [--debug-full-request]
@@ -98,7 +100,8 @@ func usage() {
   costrict-router login --url <plugin-login-url>
   costrict-router serve [--addr 127.0.0.1:14567] [--debug] [--debug-full-request]
   costrict-router models [--json]
-  costrict-router test [model] [--prompt 你好]
+  costrict-router test [--model name] [--prompt 你好]
+  costrict-router test all [--runs 3] [--prompt "只回复 OK"]
   costrict-router fallback [model] [--clear]
   costrict-router codex-catalog [--codex-home ~/.codex] [--no-config]
   costrict-router start [--debug] [--debug-full-request]
@@ -297,12 +300,36 @@ func cmdModels(args []string) error {
 // 与浏览不同，它会刷新 token、按指定（或兜底/首个可用）模型 POST 一条消息并打印回复，
 // 帮助快速区分「配置/登录问题」和「上游模型不可用」。
 func cmdTest(args []string) error {
+	// 把自然的 `test all --runs 3` 转成 flag 能继续解析的形式；标准 flag 遇到位置参数会停止。
+	allCommand := len(args) > 0 && args[0] == "all"
+	if allCommand {
+		args = args[1:]
+	}
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	configPath := fs.String("config", "", i18n.T("config file path", "配置文件路径"))
+	modelName := fs.String("model", "", i18n.T("model name to test", "要测试的模型名称"))
+	allModels := fs.Bool("all", false, i18n.T("test and rank all available models", "测试全部可用模型并按速度排名"))
+	runs := fs.Int("runs", 3, i18n.T("number of runs per model in all mode", "全部模型模式下每个模型的测试次数"))
 	prompt := fs.String("prompt", "你好", i18n.T("message to send", "要发送的测试消息"))
 	timeout := fs.Duration("timeout", 60*time.Second, i18n.T("request timeout", "请求超时时间"))
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	model, testAll, err := testTargetFromArgs(*modelName, allCommand || *allModels, fs.Args())
+	if err != nil {
+		return err
+	}
+	if *runs <= 0 || *runs > 100 {
+		return fmt.Errorf(i18n.T("--runs must be between 1 and 100", "--runs 必须在 1 到 100 之间"))
+	}
+	promptSpecified := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "prompt" {
+			promptSpecified = true
+		}
+	})
+	if testAll && !promptSpecified {
+		*prompt = "只回复 OK"
 	}
 	path, err := resolveConfigPath(*configPath)
 	if err != nil {
@@ -323,12 +350,11 @@ func cmdTest(args []string) error {
 	if !fresh.LoggedIn() {
 		return fmt.Errorf(i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
 	}
-
-	// 模型名：命令行位置参数 > 兜底模型 > 第一个可用模型。
-	model := ""
-	if rest := fs.Args(); len(rest) > 0 {
-		model = rest[0]
+	if testAll {
+		return testAllModels(fresh, *prompt, *timeout, *runs)
 	}
+
+	// 模型名：--model/兼容的位置参数 > 兜底模型 > 第一个可用模型。
 	if model == "" {
 		model = fresh.FallbackModel
 	}
@@ -358,6 +384,145 @@ func cmdTest(args []string) error {
 		return err
 	}
 	fmt.Printf(i18n.T("✅ Connected (%.1fs); model replied:\n%s\n", "✅ 连通成功（耗时 %.1fs），模型回复:\n%s\n"), elapsed.Seconds(), reply)
+	return nil
+}
+
+// testTargetFromArgs 解析单模型/全部模型模式；位置参数模型名仅为兼容旧用法保留。
+func testTargetFromArgs(modelFlag string, all bool, positional []string) (string, bool, error) {
+	if len(positional) > 1 {
+		return "", false, fmt.Errorf(i18n.T("test accepts at most one positional model name", "test 最多接受一个位置参数模型名"))
+	}
+	if len(positional) == 1 && positional[0] == "all" {
+		all = true
+		positional = nil
+	}
+	if all && (modelFlag != "" || len(positional) > 0) {
+		return "", false, fmt.Errorf(i18n.T("all mode cannot be combined with a model name", "全部模型模式不能同时指定模型名称"))
+	}
+	if modelFlag != "" && len(positional) == 1 {
+		return "", false, fmt.Errorf(i18n.T("model name cannot be specified by both --model and a positional argument", "不能同时通过 --model 和位置参数指定模型名称"))
+	}
+	if modelFlag != "" {
+		return modelFlag, false, nil
+	}
+	if len(positional) == 1 {
+		return positional[0], false, nil
+	}
+	return "", all, nil
+}
+
+type modelTestResult struct {
+	model     string
+	durations []time.Duration
+	failures  int
+}
+
+func (r modelTestResult) average() time.Duration {
+	if len(r.durations) == 0 {
+		return 0
+	}
+	var total time.Duration
+	for _, duration := range r.durations {
+		total += duration
+	}
+	return total / time.Duration(len(r.durations))
+}
+
+func (r modelTestResult) fastest() time.Duration {
+	if len(r.durations) == 0 {
+		return 0
+	}
+	fastest := r.durations[0]
+	for _, duration := range r.durations[1:] {
+		if duration < fastest {
+			fastest = duration
+		}
+	}
+	return fastest
+}
+
+func (r modelTestResult) slowest() time.Duration {
+	var slowest time.Duration
+	for _, duration := range r.durations {
+		if duration > slowest {
+			slowest = duration
+		}
+	}
+	return slowest
+}
+
+func sortModelTestResults(results []modelTestResult) {
+	sort.SliceStable(results, func(i, j int) bool {
+		// 成功次数更多的优先；成功次数相同再比较平均耗时。
+		if len(results[i].durations) != len(results[j].durations) {
+			return len(results[i].durations) > len(results[j].durations)
+		}
+		if results[i].average() != results[j].average() {
+			return results[i].average() < results[j].average()
+		}
+		return results[i].model < results[j].model
+	})
+}
+
+func testAllModels(cfg config.Config, prompt string, timeout time.Duration, runs int) error {
+	raw, err := fetchModels(context.Background(), cfg)
+	if err != nil {
+		return err
+	}
+	models, err := parseModelIDs(raw)
+	if err != nil {
+		return err
+	}
+	if len(models) == 0 {
+		return fmt.Errorf(i18n.T("upstream returned no available models", "上游未返回任何可用模型"))
+	}
+
+	fmt.Printf(i18n.T(
+		"Testing %d models, %d runs each (sending %q)...\n",
+		"开始测试 %d 个模型，每个模型 %d 次（发送 %q）...\n"), len(models), runs, prompt)
+	results := make([]modelTestResult, 0, len(models))
+	totalFailures := 0
+	for modelIndex, model := range models {
+		fmt.Printf("\n[%d/%d] %s\n", modelIndex+1, len(models), model)
+		result := modelTestResult{model: model}
+		for run := 1; run <= runs; run++ {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			start := time.Now()
+			_, requestErr := sendChatProbe(ctx, cfg, model, prompt)
+			elapsed := time.Since(start)
+			cancel()
+			if requestErr != nil {
+				result.failures++
+				totalFailures++
+				fmt.Printf(i18n.T("  ❌ Run %d/%d failed (%.2fs): %v\n", "  ❌ 第 %d/%d 次失败（%.2fs）: %v\n"), run, runs, elapsed.Seconds(), requestErr)
+				continue
+			}
+			result.durations = append(result.durations, elapsed)
+			fmt.Printf(i18n.T("  ✅ Run %d/%d: %.2fs\n", "  ✅ 第 %d/%d 次: %.2fs\n"), run, runs, elapsed.Seconds())
+		}
+		results = append(results, result)
+	}
+
+	sortModelTestResults(results)
+	fmt.Println(i18n.T("\nSpeed ranking:", "\n速度排名:"))
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, i18n.T("RANK\tMODEL\tSUCCESS\tAVG\tFASTEST\tSLOWEST", "排名\t模型\t成功\t平均\t最快\t最慢"))
+	for index, result := range results {
+		average, fastest, slowest := "-", "-", "-"
+		if len(result.durations) > 0 {
+			average = fmt.Sprintf("%.2fs", result.average().Seconds())
+			fastest = fmt.Sprintf("%.2fs", result.fastest().Seconds())
+			slowest = fmt.Sprintf("%.2fs", result.slowest().Seconds())
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%d/%d\t%s\t%s\t%s\n",
+			index+1, result.model, len(result.durations), runs, average, fastest, slowest)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if totalFailures > 0 {
+		return fmt.Errorf(i18n.T("benchmark completed with %d failed requests", "测速完成，但有 %d 次请求失败"), totalFailures)
+	}
 	return nil
 }
 
