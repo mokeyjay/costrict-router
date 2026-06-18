@@ -27,8 +27,9 @@ import (
 	"costrict-router/internal/i18n"
 	"costrict-router/internal/ids"
 	"costrict-router/internal/logx"
-	"costrict-router/internal/proxy"
 	"costrict-router/internal/server"
+	"costrict-router/internal/updatecheck"
+	"costrict-router/internal/version"
 )
 
 func main() {
@@ -250,6 +251,7 @@ func cmdServe(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	updatecheck.Start(ctx, logger, version.Current)
 	// shutdown token 仅由 start 通过环境变量注入；前台 serve 无 token，则 /-/shutdown 一律拒绝（用 Ctrl+C 退出）。
 	return server.Run(ctx, path, *cfg, *addr, logger, *debugFullRequest, os.Getenv(envShutdownToken))
 }
@@ -387,7 +389,7 @@ func sendChatProbe(ctx context.Context, cfg config.Config, model, prompt string)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
-	req.Header.Set("User-Agent", "costrict-router/"+proxy.Version)
+	req.Header.Set("User-Agent", "costrict-router/"+version.Current)
 	req.Header.Set("X-Request-ID", requestID)
 	req.Header.Set("zgsm-request-id", requestID)
 	req.Header.Set("zgsm-task-id", ids.UUID())
@@ -1258,7 +1260,7 @@ func fetchModels(ctx context.Context, cfg config.Config) ([]byte, error) {
 	req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
 	req.Header.Set("X-Request-ID", ids.UUID())
 	req.Header.Set("x-user-id", cfg.UserID)
-	req.Header.Set("User-Agent", "costrict-router/"+proxy.Version)
+	req.Header.Set("User-Agent", "costrict-router/"+version.Current)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err

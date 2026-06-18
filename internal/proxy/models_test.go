@@ -170,3 +170,146 @@ func TestAddClaudeModelAlias(t *testing.T) {
 		t.Fatalf("次项改写不对: %+v", payload.Data[1])
 	}
 }
+
+func TestConvertToAnthropicModelsFormat(t *testing.T) {
+	// 模拟 addClaudeModelAlias 之后的输出（OpenAI 风格 + claude- 前缀）
+	input := `{"object":"list","data":[{"id":"claude-Auto","object":"model","created":1781070586,"owned_by":"unknown","contextWindow":200000,"maxTokens":32768,"display_name":"Auto","description":"auto模式","supportsImages":false,"supportsComputerUse":false,"supportsPromptCache":true,"creditConsumption":-1},{"id":"claude-Tencent-kimi-k2.6","object":"model","created":1781070586,"contextWindow":200000,"maxTokens":32000,"display_name":"Tencent-kimi-k2.6","supportsImages":true}]}`
+	out, ok := convertToAnthropicModelsFormat([]byte(input))
+	if !ok {
+		t.Fatal("转换应成功")
+	}
+
+	var payload struct {
+		HasMore  *bool  `json:"has_more"`
+		FirstID  string `json:"first_id"`
+		LastID   string `json:"last_id"`
+		Data     []struct {
+			ID             string `json:"id"`
+			Type           string `json:"type"`
+			DisplayName    string `json:"display_name"`
+			CreatedAt      string `json:"created_at"`
+			MaxInputTokens int    `json:"max_input_tokens"`
+			MaxTokens      int    `json:"max_tokens"`
+			// 以下字段不应出现
+			Object        string `json:"object,omitempty"`
+			OwnedBy       string `json:"owned_by,omitempty"`
+			ContextWindow int    `json:"contextWindow,omitempty"`
+		} `json:"data"`
+		// 不应有 object 字段
+		Object string `json:"object,omitempty"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("转换后不是合法 JSON: %v\n%s", err, out)
+	}
+
+	// 顶层：Anthropic 风格分页字段
+	if payload.HasMore == nil || *payload.HasMore != false {
+		t.Fatalf("has_more 应为 false, got %v", payload.HasMore)
+	}
+	if payload.FirstID != "claude-Auto" {
+		t.Fatalf("first_id 应为 claude-Auto, got %q", payload.FirstID)
+	}
+	if payload.LastID != "claude-Tencent-kimi-k2.6" {
+		t.Fatalf("last_id 应为 claude-Tencent-kimi-k2.6, got %q", payload.LastID)
+	}
+	if payload.Object != "" {
+		t.Fatalf("不应有顶层 object 字段, got %q", payload.Object)
+	}
+
+	// 模型项数
+	if len(payload.Data) != 2 {
+		t.Fatalf("模型数应为 2, got=%d", len(payload.Data))
+	}
+
+	// 第一个模型
+	m0 := payload.Data[0]
+	if m0.ID != "claude-Auto" {
+		t.Fatalf("id 应为 claude-Auto, got %q", m0.ID)
+	}
+	if m0.Type != "model" {
+		t.Fatalf("type 应为 model, got %q", m0.Type)
+	}
+	if m0.DisplayName != "Auto" {
+		t.Fatalf("display_name 应为 Auto, got %q", m0.DisplayName)
+	}
+	if m0.CreatedAt == "" {
+		t.Fatal("created_at 不应为空")
+	}
+	if m0.MaxInputTokens != 200000 {
+		t.Fatalf("max_input_tokens 应为 200000, got %d", m0.MaxInputTokens)
+	}
+	if m0.MaxTokens != 32768 {
+		t.Fatalf("max_tokens 应为 32768, got %d", m0.MaxTokens)
+	}
+	// OpenAI 风格字段不应出现
+	if m0.Object != "" {
+		t.Fatalf("不应有 object 字段, got %q", m0.Object)
+	}
+	if m0.OwnedBy != "" {
+		t.Fatalf("不应有 owned_by 字段, got %q", m0.OwnedBy)
+	}
+	if m0.ContextWindow != 0 {
+		t.Fatalf("不应有 contextWindow 字段, got %d", m0.ContextWindow)
+	}
+
+	// created_at 是合法的 RFC 3339
+	if !strings.Contains(m0.CreatedAt, "T") || !strings.Contains(m0.CreatedAt, "Z") {
+		t.Fatalf("created_at 应为 RFC 3339 格式, got %q", m0.CreatedAt)
+	}
+}
+
+func TestConvertToAnthropicModelsFormatEmptyList(t *testing.T) {
+	input := `{"object":"list","data":[]}`
+	out, ok := convertToAnthropicModelsFormat([]byte(input))
+	if !ok {
+		t.Fatal("空列表转换应成功")
+	}
+	var payload struct {
+		HasMore *bool  `json:"has_more"`
+		Data    []any  `json:"data"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("转换后不是合法 JSON: %v", err)
+	}
+	if payload.HasMore == nil || *payload.HasMore != false {
+		t.Fatal("空列表 has_more 应为 false")
+	}
+	if len(payload.Data) != 0 {
+		t.Fatalf("空列表 data 应为 [], got %d items", len(payload.Data))
+	}
+}
+
+func TestConvertToAnthropicModelsFormatMissingCreated(t *testing.T) {
+	// 没有 created 字段的模型项：created_at 应使用当前时间（不会是空）
+	input := `{"data":[{"id":"claude-test","contextWindow":100000,"maxTokens":4096}]}`
+	out, ok := convertToAnthropicModelsFormat([]byte(input))
+	if !ok {
+		t.Fatal("缺少 created 字段转换应成功")
+	}
+	var payload struct {
+		Data []struct {
+			ID        string `json:"id"`
+			CreatedAt string `json:"created_at"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("转换后不是合法 JSON: %v", err)
+	}
+	if len(payload.Data) != 1 {
+		t.Fatalf("应有 1 个模型, got %d", len(payload.Data))
+	}
+	if payload.Data[0].CreatedAt == "" {
+		t.Fatal("缺少 created 时 created_at 不应为空")
+	}
+}
+
+func TestConvertToAnthropicModelsFormatInvalidInput(t *testing.T) {
+	// 非法 JSON
+	if _, ok := convertToAnthropicModelsFormat([]byte(`not json`)); ok {
+		t.Fatal("非法 JSON 应返回 false")
+	}
+	// 缺少 data 字段
+	if _, ok := convertToAnthropicModelsFormat([]byte(`{"object":"list"}`)); ok {
+		t.Fatal("缺少 data 字段应返回 false")
+	}
+}
