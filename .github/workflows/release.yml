@@ -155,8 +155,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 按提交历史找到上一个 tag，用于生成从上个版本到本次的提交列表
-          prev_tag="$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || true)"
+          # 按提交历史找到上一个正式版 tag，跳过 beta、alpha 等名称中含有“-”的预发布版本
+          prev_tag="$(git describe --tags --abbrev=0 --exclude='*-*' "${VERSION}^" 2>/dev/null || true)"
 
           {
             echo "## 更新内容"
