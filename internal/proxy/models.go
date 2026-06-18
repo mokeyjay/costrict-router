@@ -255,6 +255,110 @@ func addClaudeModelAlias(body []byte) ([]byte, bool) {
 	return bytes.TrimRight(buf.Bytes(), "\n"), true
 }
 
+// convertToAnthropicModelsFormat 将 OpenAI 风格的 /v1/models 响应转为 Anthropic 风格，
+// 使 Claude Code 的 gateway model discovery（CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1）
+// 能正确解析。Anthropic SDK 的 models.list() 要求 Anthropic 格式：
+//
+//	{"data":[{"id":"...","type":"model","display_name":"...","created_at":"RFC3339","max_input_tokens":N,"max_tokens":N}], "has_more":false, "first_id":"...", "last_id":"..."}
+//
+// OpenAI 风格（上游返回）用的是 object/created/contextWindow/maxTokens，SDK 无法解析。
+// 解析失败时返回 (nil, false)，调用方退回原始响应。
+func convertToAnthropicModelsFormat(body []byte) ([]byte, bool) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false
+	}
+	dataRaw, ok := payload["data"]
+	if !ok {
+		return nil, false
+	}
+
+	// 上游模型项（OpenAI 风格）
+	type upstreamModel struct {
+		ID                    string `json:"id"`
+		Object                string `json:"object,omitempty"`
+		Created               int64  `json:"created,omitempty"`
+		OwnedBy               string `json:"owned_by,omitempty"`
+		ContextWindow         int    `json:"contextWindow,omitempty"`
+		MaxTokens             int    `json:"maxTokens,omitempty"`
+		DisplayName           string `json:"display_name,omitempty"`
+		Description           string `json:"description,omitempty"`
+		MaxTokensKey          string `json:"maxTokensKey,omitempty"`
+		SupportsImages        bool   `json:"supportsImages,omitempty"`
+		SupportsComputerUse   bool   `json:"supportsComputerUse,omitempty"`
+		SupportsPromptCache   bool   `json:"supportsPromptCache,omitempty"`
+		SupportsReasoningBudget bool  `json:"supportsReasoningBudget,omitempty"`
+		RequiredReasoningBudget bool `json:"requiredReasoningBudget,omitempty"`
+		CreditConsumption     int    `json:"creditConsumption,omitempty"`
+		CreditDiscount        int    `json:"creditDiscount,omitempty"`
+	}
+
+	// Anthropic 风格模型项
+	type anthropicModel struct {
+		ID              string `json:"id"`
+		Type            string `json:"type"`
+		DisplayName     string `json:"display_name"`
+		CreatedAt       string `json:"created_at"`
+		MaxInputTokens  int    `json:"max_input_tokens"`
+		MaxTokens       int    `json:"max_tokens"`
+	}
+
+	var upstream []upstreamModel
+	if err := json.Unmarshal(dataRaw, &upstream); err != nil {
+		return nil, false
+	}
+
+	items := make([]anthropicModel, 0, len(upstream))
+	for _, m := range upstream {
+		if m.ID == "" {
+			continue
+		}
+		// unix timestamp → RFC 3339；缺省或零值用当前时间。
+		var createdAt string
+		if m.Created > 0 {
+			createdAt = time.Unix(m.Created, 0).UTC().Format(time.RFC3339)
+		} else {
+			createdAt = time.Now().UTC().Format(time.RFC3339)
+		}
+		items = append(items, anthropicModel{
+			ID:             m.ID,
+			Type:           "model",
+			DisplayName:    m.DisplayName,
+			CreatedAt:      createdAt,
+			MaxInputTokens: m.ContextWindow,
+			MaxTokens:      m.MaxTokens,
+		})
+	}
+
+	dataOut, err := json.Marshal(items)
+	if err != nil {
+		return nil, false
+	}
+	payload["data"] = dataOut
+	// 移除 OpenAI 风格的顶层 object 字段
+	delete(payload, "object")
+	// 补齐 Anthropic 风格的顶层分页字段
+	if raw, err := json.Marshal(false); err == nil {
+		payload["has_more"] = raw
+	}
+	if len(items) > 0 {
+		if raw, err := json.Marshal(items[0].ID); err == nil {
+			payload["first_id"] = raw
+		}
+		if raw, err := json.Marshal(items[len(items)-1].ID); err == nil {
+			payload["last_id"] = raw
+		}
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil {
+		return nil, false
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), true
+}
+
 // replaceJSONModel 仅替换顶层 model 字段，其它字段以 json.RawMessage 原样保留（不重新转义内容）。
 func replaceJSONModel(body []byte, model string) ([]byte, error) {
 	var fields map[string]json.RawMessage

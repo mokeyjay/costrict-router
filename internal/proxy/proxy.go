@@ -410,6 +410,11 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		if rewritten, ok := addClaudeModelAlias(body); ok {
 			body = rewritten
 		}
+		// Anthropic SDK 的 models.list() 要求 Anthropic 格式响应（type/created_at/max_input_tokens），
+		// 而上游返回的是 OpenAI 格式（object/created/contextWindow），必须转换。
+		if converted, ok := convertToAnthropicModelsFormat(body); ok {
+			body = converted
+		}
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	// body 可能被改写，Content-Length 必须按当前长度重设（覆盖上游可能带的旧值）。

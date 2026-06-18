@@ -322,6 +322,8 @@ func TestAuthDisabledBypassesLocalAPIKey(t *testing.T) {
 }
 
 func TestModelsAliasOnlyForAnthropicClient(t *testing.T) {
+	// 上游返回 OpenAI 风格的完整模型列表
+	upstreamBody := `{"data":[{"id":"Tencent-glm-5.1","object":"model","created":1781070586,"owned_by":"","contextWindow":198000,"maxTokens":32000,"supportsImages":false}],"object":"list"}`
 	newHandler := func() *Handler {
 		return &Handler{
 			Tokens: &fakeTokens{cfg: config.Config{
@@ -334,13 +336,14 @@ func TestModelsAliasOnlyForAnthropicClient(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"data":[{"id":"Tencent-glm-5.1"}]}`)),
+					Body:       io.NopCloser(strings.NewReader(upstreamBody)),
 				}, nil
 			})},
 		}
 	}
 
-	// Claude Code（带 anthropic-version 头）：id 应加 claude- 前缀并补 display_name。
+	// Claude Code（带 anthropic-version 头）：
+	// id 应加 claude- 前缀，补 display_name，并转为 Anthropic 格式。
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	rec := httptest.NewRecorder()
@@ -348,24 +351,77 @@ func TestModelsAliasOnlyForAnthropicClient(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"id":"claude-Tencent-glm-5.1"`) || !strings.Contains(rec.Body.String(), `"display_name":"Tencent-glm-5.1"`) {
-		t.Fatalf("Claude Code 应得到加前缀的列表: %s", rec.Body.String())
+	body := rec.Body.String()
+	// Anthropic 格式：id 带 claude- 前缀
+	if !strings.Contains(body, `"id":"claude-Tencent-glm-5.1"`) {
+		t.Fatalf("Claude Code 应得到加前缀的 id: %s", body)
+	}
+	// Anthropic 格式：display_name 存在
+	if !strings.Contains(body, `"display_name"`) {
+		t.Fatalf("Claude Code 应得到 display_name: %s", body)
+	}
+	// Anthropic 格式：type 而非 object
+	if !strings.Contains(body, `"type":"model"`) {
+		t.Fatalf("Anthropic 格式应用 type=model: %s", body)
+	}
+	if strings.Contains(body, `"object":"model"`) {
+		t.Fatalf("Anthropic 格式不应包含 object=model: %s", body)
+	}
+	// Anthropic 格式：created_at 而非 created
+	if !strings.Contains(body, `"created_at"`) {
+		t.Fatalf("Anthropic 格式应用 created_at: %s", body)
+	}
+	if strings.Contains(body, `"created":`) {
+		t.Fatalf("Anthropic 格式不应包含 created: %s", body)
+	}
+	// Anthropic 格式：max_input_tokens 而非 contextWindow
+	if !strings.Contains(body, `"max_input_tokens"`) {
+		t.Fatalf("Anthropic 格式应用 max_input_tokens: %s", body)
+	}
+	if strings.Contains(body, `"contextWindow"`) {
+		t.Fatalf("Anthropic 格式不应包含 contextWindow: %s", body)
+	}
+	// Anthropic 格式：max_tokens 而非 maxTokens
+	if !strings.Contains(body, `"max_tokens"`) {
+		t.Fatalf("Anthropic 格式应用 max_tokens: %s", body)
+	}
+	if strings.Contains(body, `"maxTokens"`) {
+		t.Fatalf("Anthropic 格式不应包含 maxTokens: %s", body)
+	}
+	// Anthropic 格式：顶层有 has_more/first_id/last_id，无 object:"list"
+	if !strings.Contains(body, `"has_more":false`) {
+		t.Fatalf("Anthropic 格式应有 has_more: %s", body)
+	}
+	if strings.Contains(body, `"object":"list"`) {
+		t.Fatalf("Anthropic 格式不应包含 object=list: %s", body)
+	}
+	// 不应包含 OpenAI 特有字段
+	if strings.Contains(body, `"owned_by"`) {
+		t.Fatalf("Anthropic 格式不应包含 owned_by: %s", body)
 	}
 	// Content-Length 必须与改写后 body 一致。
 	if cl := rec.Result().Header.Get("Content-Length"); cl != strconv.Itoa(len(rec.Body.Bytes())) {
 		t.Fatalf("Content-Length=%q 与实际 body 长度 %d 不一致", cl, len(rec.Body.Bytes()))
 	}
 
-	// 其它工具（无 anthropic-version、非 claude-code UA）：原样返回，不加前缀。
+	// 其它工具（无 anthropic-version、非 claude-code UA）：原样返回 OpenAI 格式，不加前缀。
 	req2 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req2.Header.Set("User-Agent", "codex/1.0")
 	rec2 := httptest.NewRecorder()
 	newHandler().ServeHTTP(rec2, req2)
-	if strings.Contains(rec2.Body.String(), "claude-") {
-		t.Fatalf("非 Claude 客户端不应被改写: %s", rec2.Body.String())
+	body2 := rec2.Body.String()
+	if strings.Contains(body2, "claude-") {
+		t.Fatalf("非 Claude 客户端不应被改写: %s", body2)
 	}
-	if !strings.Contains(rec2.Body.String(), `"id":"Tencent-glm-5.1"`) {
-		t.Fatalf("非 Claude 客户端应原样返回: %s", rec2.Body.String())
+	if !strings.Contains(body2, `"id":"Tencent-glm-5.1"`) {
+		t.Fatalf("非 Claude 客户端应原样返回: %s", body2)
+	}
+	// 非 Anthropic 客户端应保留 OpenAI 格式
+	if !strings.Contains(body2, `"object":"model"`) {
+		t.Fatalf("非 Claude 客户端应保留 OpenAI 格式 object: %s", body2)
+	}
+	if strings.Contains(body2, `"type":"model"`) {
+		t.Fatalf("非 Claude 客户端不应有 Anthropic 格式 type: %s", body2)
 	}
 }
 

@@ -31,37 +31,9 @@ jobs:
         run: go test ./...
 
   build:
-    name: Build ${{ matrix.asset_os }} ${{ matrix.goarch }}
+    name: Build release assets
     runs-on: ubuntu-latest
     needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goos: linux
-            asset_os: linux
-            goarch: amd64
-            archive: tar.gz
-          - goos: linux
-            asset_os: linux
-            goarch: arm64
-            archive: tar.gz
-          - goos: darwin
-            asset_os: macos
-            goarch: amd64
-            archive: tar.gz
-          - goos: darwin
-            asset_os: macos
-            goarch: arm64
-            archive: tar.gz
-          - goos: windows
-            asset_os: windows
-            goarch: amd64
-            archive: zip
-          - goos: windows
-            asset_os: windows
-            goarch: arm64
-            archive: zip
 
     steps:
       - name: Checkout
@@ -73,36 +45,16 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Build binary
+      - name: Build all release assets
         env:
-          CGO_ENABLED: "0"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ github.ref_name }}
-          ASSET_OS: ${{ matrix.asset_os }}
-        run: |
-          set -euo pipefail
-
-          binary_name="costrict-router"
-          if [ "$GOOS" = "windows" ]; then
-            binary_name="costrict-router.exe"
-          fi
-
-          package_name="costrict-router_${VERSION}_${ASSET_OS}_${GOARCH}"
-          mkdir -p "build/${package_name}" dist
-
-          go build -trimpath -o "build/${package_name}/${binary_name}" ./cmd/costrict-router
-
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            (cd "build/${package_name}" && zip -9 "../../dist/${package_name}.zip" "${binary_name}")
-          else
-            (cd "build/${package_name}" && tar -czf "../../dist/${package_name}.tar.gz" "${binary_name}")
-          fi
+          SKIP_TESTS: "1"
+        run: ./scripts/build-all.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: release-assets-${{ matrix.asset_os }}-${{ matrix.goarch }}
+          name: release-assets-all
           path: dist/*
           if-no-files-found: error
 
