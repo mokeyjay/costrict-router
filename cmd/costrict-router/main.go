@@ -1449,22 +1449,34 @@ func printModelsTo(out io.Writer, raw []byte) error {
 	// 将上游 JSON 响应整理成终端表格，避免用户直接阅读完整原始响应。
 	var payload struct {
 		Data []struct {
-			ID                  string `json:"id"`
-			ContextWindow       int    `json:"contextWindow"`
-			MaxTokens           int    `json:"maxTokens"`
-			SupportsImages      bool   `json:"supportsImages"`
-			SupportsComputerUse bool   `json:"supportsComputerUse"`
+			ID                  string   `json:"id"`
+			ContextWindow       int      `json:"contextWindow"`
+			MaxTokens           int      `json:"maxTokens"`
+			SupportsImages      bool     `json:"supportsImages"`
+			SupportsComputerUse bool     `json:"supportsComputerUse"`
+			CreditConsumption   *float64 `json:"creditConsumption"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(bytes.NewReader(raw)).Decode(&payload); err != nil {
 		return err
 	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "MODEL\tCONTEXT\tMAX_TOKENS\tIMAGE\tCOMPUTER_USE")
+	fmt.Fprintln(tw, "MODEL\tCONTEXT\tMAX_TOKENS\tIMAGE\tCOMPUTER_USE\tCREDIT")
 	for _, model := range payload.Data {
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%t\t%t\n", model.ID, model.ContextWindow, model.MaxTokens, model.SupportsImages, model.SupportsComputerUse)
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%t\t%t\t%s\n", model.ID, model.ContextWindow, model.MaxTokens, model.SupportsImages, model.SupportsComputerUse, formatCredit(model.CreditConsumption))
 	}
 	return tw.Flush()
+}
+
+// formatCredit 渲染模型的额度消耗：上游用 -1 表示按实际路由的模型计费（Auto），缺失时显示 -。
+func formatCredit(consumption *float64) string {
+	if consumption == nil {
+		return "-"
+	}
+	if *consumption < 0 {
+		return "auto"
+	}
+	return strconv.FormatFloat(*consumption, 'f', -1, 64)
 }
 
 func buildLogger(logFile string, debug bool) (*logx.Logger, func(), error) {

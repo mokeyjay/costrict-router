@@ -11,30 +11,34 @@ import (
 	"time"
 
 	"costrict-router/internal/auth"
+	"costrict-router/internal/compat"
 )
 
 const EnvConfigPath = "COSTRICT_ROUTER_CONFIG"
 
 type Config struct {
-	Version               int       `json:"version"`
-	BaseURL               string    `json:"base_url"`
-	ListenAddr            string    `json:"listen_addr"`
-	FallbackModel         string    `json:"fallback_model,omitempty"`
-	MachineCode           string    `json:"machine_code"`
-	State                 string    `json:"state"`
-	Provider              string    `json:"provider"`
-	PluginVersion         string    `json:"plugin_version"`
-	VSCodeVersion         string    `json:"vscode_version"`
-	URIScheme             string    `json:"uri_scheme"`
-	AccessToken           string    `json:"access_token"`
-	RefreshToken          string    `json:"refresh_token"`
-	LocalAPIKeyHash       string    `json:"local_api_key_hash,omitempty"`
-	LocalAPIKeyCreatedAt  time.Time `json:"local_api_key_created_at,omitempty"`
-	AuthDisabled          bool      `json:"auth_disabled,omitempty"`
-	UserID                string    `json:"user_id"`
-	AccessTokenExpiresAt  time.Time `json:"access_token_expires_at,omitempty"`
-	RefreshTokenExpiresAt time.Time `json:"refresh_token_expires_at,omitempty"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	Version       int    `json:"version"`
+	BaseURL       string `json:"base_url"`
+	ListenAddr    string `json:"listen_addr"`
+	FallbackModel string `json:"fallback_model,omitempty"`
+	// ModelPolicyOverrides 按模型名（不区分大小写）覆盖内置的上游兼容降级策略，
+	// 上游修复限制后用户改配置即可生效，无需等待新版本。键为模型 id，如 "Tencent-kimi-k2.6"。
+	ModelPolicyOverrides  map[string]compat.ModelPolicyOverride `json:"model_policy_overrides,omitempty"`
+	MachineCode           string                                `json:"machine_code"`
+	State                 string                                `json:"state"`
+	Provider              string                                `json:"provider"`
+	PluginVersion         string                                `json:"plugin_version"`
+	VSCodeVersion         string                                `json:"vscode_version"`
+	URIScheme             string                                `json:"uri_scheme"`
+	AccessToken           string                                `json:"access_token"`
+	RefreshToken          string                                `json:"refresh_token"`
+	LocalAPIKeyHash       string                                `json:"local_api_key_hash,omitempty"`
+	LocalAPIKeyCreatedAt  time.Time                             `json:"local_api_key_created_at,omitempty"`
+	AuthDisabled          bool                                  `json:"auth_disabled,omitempty"`
+	UserID                string                                `json:"user_id"`
+	AccessTokenExpiresAt  time.Time                             `json:"access_token_expires_at,omitempty"`
+	RefreshTokenExpiresAt time.Time                             `json:"refresh_token_expires_at,omitempty"`
+	UpdatedAt             time.Time                             `json:"updated_at"`
 }
 
 type TokenFile struct {

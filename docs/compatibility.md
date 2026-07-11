@@ -17,3 +17,7 @@
 - **强制工具选择会按模型降级**：DeepSeek thinking 模式不接受 `required` 或指定函数；Kimi 的流式 thinking 模式也不接受。为避免请求直接失败，本工具会将这些组合降级为 `auto`，因此“必须调用”主要依靠提示词保证。
 
 - **工具与结构化输出存在模型差异**：Kimi、DeepSeek 同时收到工具和 JSON Schema 时会跳过工具，因此本工具会移除这两个模型的 `response_format`；GLM、MiniMax 则会保留。Kimi 结构化输出时还会忽略不兼容的显式温度。
+
+以上两条降级都可以在配置文件里按模型关闭——上游修复限制后无需等待新版本，见 [configuration.md](configuration.md) 的 `model_policy_overrides`。
+
+- **token 计数是本地估算**：`/v1/messages/count_tokens` 由本工具在本地按字符启发式估算（上游没有对应接口），数字量级正确但并非上游分词器的精确结果，仅用于客户端跟踪上下文用量。

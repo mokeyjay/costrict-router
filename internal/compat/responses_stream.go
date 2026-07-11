@@ -10,9 +10,13 @@ import (
 	"costrict-router/internal/ids"
 )
 
+// responsesKeepalive 是等待上游期间发给客户端的保活字节。Responses 协议没有 ping 事件，
+// 用 SSE 注释行（规范要求解析器忽略，codex 的 eventsource-stream 亦如此），不占用 sequence_number。
+var responsesKeepalive = []byte(": keep-alive\n\n")
+
 // encodeResponsesStream 把上游 Chat Completions 的 SSE 流转换成 OpenAI Responses 的语义事件流。
 func encodeResponsesStream(r io.Reader, model string, parallelToolCalls bool) io.Reader {
-	return streamPipe(func(write func([]byte) error) error {
+	return streamPipe(responsesKeepalive, func(write func([]byte) error) error {
 		st := &responsesStreamState{
 			write:             write,
 			model:             model,
@@ -21,6 +25,8 @@ func encodeResponsesStream(r io.Reader, model string, parallelToolCalls bool) io
 			outputs:           make(map[int]any),
 			tools:             make(map[int]*responsesStreamTool),
 		}
+		// 立即发出 response.created/in_progress，等待上游首块期间由注释行保活。
+		st.ensureStarted(chatChunk{})
 		err := scanChatStream(r, func(payload []byte) error {
 			if msg, ok := chatStreamError(payload); ok {
 				st.errMsg = msg

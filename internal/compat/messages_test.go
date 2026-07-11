@@ -317,3 +317,204 @@ func TestMessagesEncodeStreamInterleavedParallelToolCalls(t *testing.T) {
 		}
 	}
 }
+
+// 回归：Anthropic server tool（web_search 等）没有 input_schema，上游也不支持，
+// 不能转成无参 function 工具送给上游。
+func TestMessagesDecodeSkipsServerTools(t *testing.T) {
+	body := `{
+		"model":"m","max_tokens":16,
+		"messages":[{"role":"user","content":"go"}],
+		"tools":[
+			{"name":"web_search","type":"web_search_20250305","max_uses":5},
+			{"name":"f","input_schema":{"type":"object"}},
+			{"name":"g","type":"custom","input_schema":{"type":"object"}}
+		]
+	}`
+	chatBody, _, err := (MessagesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat chatRequest
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.Tools) != 2 || chat.Tools[0].Function.Name != "f" || chat.Tools[1].Function.Name != "g" {
+		t.Fatalf("tools = %+v", chat.Tools)
+	}
+}
+
+// 回归：客户端未开启 thinking 时，assistant 工具调用消息也要带 reasoning_content 占位符，
+// 与 Responses 侧 ensureToolReasoning 一致，防御 kimi 等上游的校验回归。
+func TestMessagesDecodeToolCallWithoutThinkingGetsPlaceholderReasoning(t *testing.T) {
+	body := `{
+		"model":"m","max_tokens":16,
+		"messages":[
+			{"role":"user","content":"read"},
+			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"read","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
+		]
+	}`
+	chatBody, _, err := (MessagesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat chatRequest
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	var asst *chatMessage
+	for i := range chat.Messages {
+		if chat.Messages[i].Role == "assistant" {
+			asst = &chat.Messages[i]
+		}
+	}
+	if asst == nil || asst.ReasoningContent != " " {
+		t.Fatalf("assistant = %+v: %s", asst, chatBody)
+	}
+}
+
+// 回归：user 消息里 text 排在 tool_result 之前时（不合规客户端），
+// tool 消息必须重排到最前，否则 user 文本会插在 tool_calls 与 tool 结果之间被上游拒绝。
+func TestMessagesDecodeTextBeforeToolResultReordered(t *testing.T) {
+	body := `{
+		"model":"m","max_tokens":16,
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"f","input":{}}]},
+			{"role":"user","content":[
+				{"type":"text","text":"env details"},
+				{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}
+			]}
+		]
+	}`
+	chatBody, _, err := (MessagesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat chatRequest
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	// assistant(tool_calls) -> tool -> user(text)
+	if len(chat.Messages) != 3 || chat.Messages[1].Role != "tool" || chat.Messages[2].Role != "user" {
+		t.Fatalf("messages = %s", chatBody)
+	}
+	if chat.Messages[2].Content != "env details" {
+		t.Fatalf("user message = %+v", chat.Messages[2])
+	}
+}
+
+// 回归：纯文本分片压平为字符串（与官方扩展一致，非视觉上游更兼容）。
+func TestMessagesDecodeUserTextPartsFlattened(t *testing.T) {
+	body := `{
+		"model":"m","max_tokens":16,
+		"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]
+	}`
+	chatBody, _, err := (MessagesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat chatRequest
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	if chat.Messages[0].Content != "a\nb" {
+		t.Fatalf("content = %#v", chat.Messages[0].Content)
+	}
+}
+
+// 回归：上游首个增量只有参数、id/name 晚到时，tool_use 块要推迟到 name 就绪再发，
+// 之前缓冲的参数随块首增量补发，不能发出空 id/name 的块。
+func TestMessagesEncodeStreamToolCallLateIDAndName(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":"}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"f","arguments":"1}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	out := readAll(t, (MessagesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true))
+	if strings.Contains(out, `"name":""`) || strings.Contains(out, `"id":""`) {
+		t.Fatalf("发出了空 id/name 的块:\n%s", out)
+	}
+	for _, want := range []string{
+		`"id":"call_9"`, `"name":"f"`, `"partial_json":"{\"a\":"`, `"partial_json":"1}"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q:\n%s", want, out)
+		}
+	}
+	// 缓冲的参数必须在块 start 之后才发出
+	if start, delta := strings.Index(out, `"type":"tool_use"`), strings.Index(out, "input_json_delta"); start < 0 || delta < start {
+		t.Fatalf("增量先于块 start:\n%s", out)
+	}
+}
+
+// 回归：上游全程没给 tool id 时补一个非空 id（Anthropic 协议要求 tool_use id 非空）。
+func TestMessagesEncodeStreamToolCallSynthesizesID(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	out := readAll(t, (MessagesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true))
+	if strings.Contains(out, `"id":""`) {
+		t.Fatalf("tool_use id 为空:\n%s", out)
+	}
+	if !strings.Contains(out, `"id":"call_`) {
+		t.Fatalf("未补全 id:\n%s", out)
+	}
+}
+
+// 回归：kimi 偶发在第一个参数对象后继续输出第二段 JSON；Anthropic 流式协议没有
+// 最终修正事件，垃圾必须在转发增量时就拦下。
+func TestMessagesEncodeStreamToolCallDropsSecondJSONObject(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{\"a\":1}"}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"b\":2}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	out := readAll(t, (MessagesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true))
+	if !strings.Contains(out, `"partial_json":"{\"a\":1}"`) {
+		t.Fatalf("第一个对象缺失:\n%s", out)
+	}
+	if strings.Contains(out, `\"b\"`) {
+		t.Fatalf("第二段 JSON 未被拦截:\n%s", out)
+	}
+}
+
+// 回归：MiniMax 偶发把整个参数对象再次编码成 JSON 字符串。Messages 流式响应
+// 必须先解包再发 input_json_delta，否则 Anthropic 客户端最终得到的是字符串而非对象。
+func TestMessagesEncodeStreamToolCallUnwrapsDoubleEncodedJSONObject(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"\"{\\\"a\\\":"}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}\""}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	out := readAll(t, (MessagesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true))
+	if !strings.Contains(out, `"partial_json":"{\"a\":1}"`) {
+		t.Fatalf("未发出解包后的参数对象:\n%s", out)
+	}
+	if strings.Contains(out, `"partial_json":"\\\"`) {
+		t.Fatalf("仍向客户端发出了外层 JSON 字符串:\n%s", out)
+	}
+}
+
+// 回归：工具块随文本切换关闭后，迟到的参数增量只能丢弃，不能凭空开出空 name 的新块。
+func TestMessagesEncodeStreamTextAfterToolCallDropsLateArgs(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{\"a\":"}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"content":"text"}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	out := readAll(t, (MessagesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true))
+	if strings.Contains(out, `"name":""`) {
+		t.Fatalf("出现空 name 的块:\n%s", out)
+	}
+	// 两个块：tool_use + text
+	if count := strings.Count(out, "event: content_block_start"); count != 2 {
+		t.Fatalf("content_block_start = %d:\n%s", count, out)
+	}
+}

@@ -37,7 +37,7 @@ func TestApplyUpstreamModelPolicy(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			out, err := ApplyUpstreamModelPolicy([]byte(test.body))
+			out, err := ApplyUpstreamModelPolicy([]byte(test.body), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -71,7 +71,7 @@ func TestChatParallelToolCallsDefaultAndExplicit(t *testing.T) {
 
 func TestApplyUpstreamModelPolicyPreservesUnknownChatFields(t *testing.T) {
 	body := []byte(`{"model":"Tencent-deepseek-v4-pro","messages":[],"tool_choice":"required","seed":42,"frequency_penalty":0.5,"vendor_extension":{"x":1}}`)
-	out, err := ApplyUpstreamModelPolicy(body)
+	out, err := ApplyUpstreamModelPolicy(body, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,5 +83,42 @@ func TestApplyUpstreamModelPolicyPreservesUnknownChatFields(t *testing.T) {
 		if _, ok := fields[name]; !ok {
 			t.Fatalf("字段 %s 被错误丢弃: %s", name, out)
 		}
+	}
+}
+
+// 回归：model_policy_overrides 按模型关闭默认降级（不区分大小写匹配），上游修复后无需等发版。
+func TestApplyUpstreamModelPolicyOverrides(t *testing.T) {
+	body := []byte(`{"model":"Tencent-kimi-k2.6","messages":[],"stream":true,"temperature":0,"tools":[{"type":"function","function":{"name":"f"}}],"tool_choice":"required","response_format":{"type":"json_object"}}`)
+	overrides := map[string]ModelPolicyOverride{
+		"tencent-KIMI-k2.6": {KeepToolChoice: true, KeepResponseFormat: true, KeepTemperature: true},
+	}
+	out, err := ApplyUpstreamModelPolicy(body, overrides)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request map[string]any
+	if err := json.Unmarshal(out, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request["tool_choice"] != "required" {
+		t.Fatalf("tool_choice = %v", request["tool_choice"])
+	}
+	if _, ok := request["response_format"]; !ok {
+		t.Fatalf("response_format 被移除: %s", out)
+	}
+	if _, ok := request["temperature"]; !ok {
+		t.Fatalf("temperature 被移除: %s", out)
+	}
+	// 覆盖只对命中的模型生效
+	other := []byte(`{"model":"Tencent-deepseek-v4-pro","messages":[],"tools":[{"type":"function","function":{"name":"f"}}],"tool_choice":"required"}`)
+	out, err = ApplyUpstreamModelPolicy(other, overrides)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request["tool_choice"] != "auto" {
+		t.Fatalf("未命中的模型不应受覆盖影响: %v", request["tool_choice"])
 	}
 }
