@@ -3,6 +3,7 @@ package compat
 import (
 	"encoding/json"
 	"io"
+	"sort"
 
 	"costrict-router/internal/ids"
 )
@@ -10,7 +11,7 @@ import (
 // encodeAnthropicStream 把上游 Chat Completions 的 SSE 流转换成 Anthropic Messages 的 SSE 事件流。
 func encodeAnthropicStream(r io.Reader, model string) io.Reader {
 	return streamPipe(func(write func([]byte) error) error {
-		st := &anthropicStreamState{write: write, model: model}
+		st := &anthropicStreamState{write: write, model: model, tools: make(map[int]*anthropicStreamTool)}
 		err := scanChatStream(r, func(payload []byte) error {
 			if msg, ok := chatStreamError(payload); ok {
 				st.errMsg = msg
@@ -31,14 +32,15 @@ type anthropicStreamState struct {
 	write func([]byte) error
 	model string
 
-	started      bool
-	messageID    string
-	curKind      string // "", "thinking", "text", "tool"
-	curToolIndex int    // 当前打开的 tool_use 对应的上游 tool_calls 下标
-	blockOpen    bool
-	blockIndex   int // 下一个要分配的 Anthropic content block 序号
-	hasToolCalls bool
-	stopReason   string
+	started        bool
+	messageID      string
+	curKind        string // "", "thinking", "text"
+	curBlockIndex  int
+	nextBlockIndex int
+	blockOpen      bool
+	tools          map[int]*anthropicStreamTool
+	hasToolCalls   bool
+	stopReason     string
 
 	sawReasoningField bool
 	think             thinkSplitter
@@ -46,6 +48,10 @@ type anthropicStreamState struct {
 
 	inputTokens  int
 	outputTokens int
+}
+
+type anthropicStreamTool struct {
+	blockIndex int
 }
 
 func (s *anthropicStreamState) emit(event string, data any) {
@@ -79,17 +85,23 @@ func (s *anthropicStreamState) closeBlock() {
 	}
 	s.emit("content_block_stop", map[string]any{
 		"type":  "content_block_stop",
-		"index": s.blockIndex,
+		"index": s.curBlockIndex,
 	})
 	s.blockOpen = false
-	s.blockIndex++
 	s.curKind = ""
 }
 
+func (s *anthropicStreamState) allocateBlockIndex() int {
+	index := s.nextBlockIndex
+	s.nextBlockIndex++
+	return index
+}
+
 func (s *anthropicStreamState) openBlock(kind string, block map[string]any) {
+	s.curBlockIndex = s.allocateBlockIndex()
 	s.emit("content_block_start", map[string]any{
 		"type":          "content_block_start",
-		"index":         s.blockIndex,
+		"index":         s.curBlockIndex,
 		"content_block": block,
 	})
 	s.blockOpen = true
@@ -99,11 +111,12 @@ func (s *anthropicStreamState) openBlock(kind string, block map[string]any) {
 func (s *anthropicStreamState) emitReasoning(text string) {
 	if s.curKind != "thinking" {
 		s.closeBlock()
+		s.closeTools()
 		s.openBlock("thinking", map[string]any{"type": "thinking", "thinking": ""})
 	}
 	s.emit("content_block_delta", map[string]any{
 		"type":  "content_block_delta",
-		"index": s.blockIndex,
+		"index": s.curBlockIndex,
 		"delta": map[string]any{"type": "thinking_delta", "thinking": text},
 	})
 }
@@ -111,11 +124,12 @@ func (s *anthropicStreamState) emitReasoning(text string) {
 func (s *anthropicStreamState) emitText(text string) {
 	if s.curKind != "text" {
 		s.closeBlock()
+		s.closeTools()
 		s.openBlock("text", map[string]any{"type": "text", "text": ""})
 	}
 	s.emit("content_block_delta", map[string]any{
 		"type":  "content_block_delta",
-		"index": s.blockIndex,
+		"index": s.curBlockIndex,
 		"delta": map[string]any{"type": "text_delta", "text": text},
 	})
 }
@@ -164,20 +178,26 @@ func (s *anthropicStreamState) consume(chunk chatChunk) error {
 		if tc.Index != nil {
 			idx = *tc.Index
 		}
-		if s.curKind != "tool" || s.curToolIndex != idx {
+		tool := s.tools[idx]
+		if tool == nil {
 			s.closeBlock()
-			s.curToolIndex = idx
-			s.openBlock("tool", map[string]any{
-				"type":  "tool_use",
-				"id":    tc.ID,
-				"name":  tc.Function.Name,
-				"input": map[string]any{},
+			tool = &anthropicStreamTool{blockIndex: s.allocateBlockIndex()}
+			s.tools[idx] = tool
+			s.emit("content_block_start", map[string]any{
+				"type":  "content_block_start",
+				"index": tool.blockIndex,
+				"content_block": map[string]any{
+					"type":  "tool_use",
+					"id":    tc.ID,
+					"name":  tc.Function.Name,
+					"input": map[string]any{},
+				},
 			})
 		}
 		if tc.Function.Arguments != "" {
 			s.emit("content_block_delta", map[string]any{
 				"type":  "content_block_delta",
-				"index": s.blockIndex,
+				"index": tool.blockIndex,
 				"delta": map[string]any{"type": "input_json_delta", "partial_json": tc.Function.Arguments},
 			})
 		}
@@ -187,6 +207,21 @@ func (s *anthropicStreamState) consume(chunk chatChunk) error {
 		s.stopReason = anthropicStopReason(*choice.FinishReason, s.hasToolCalls)
 	}
 	return nil
+}
+
+func (s *anthropicStreamState) closeTools() {
+	tools := make([]*anthropicStreamTool, 0, len(s.tools))
+	for _, tool := range s.tools {
+		tools = append(tools, tool)
+	}
+	sort.Slice(tools, func(i, j int) bool { return tools[i].blockIndex < tools[j].blockIndex })
+	for _, tool := range tools {
+		s.emit("content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": tool.blockIndex,
+		})
+	}
+	s.tools = make(map[int]*anthropicStreamTool)
 }
 
 func (s *anthropicStreamState) finish() {
@@ -210,6 +245,7 @@ func (s *anthropicStreamState) finish() {
 	// 上游在 SSE 中返回了错误：发出 Anthropic error 事件，避免静默结束。
 	if s.errMsg != "" {
 		s.closeBlock()
+		s.closeTools()
 		s.emit("error", map[string]any{
 			"type":  "error",
 			"error": map[string]any{"type": "api_error", "message": s.errMsg},
@@ -228,6 +264,7 @@ func (s *anthropicStreamState) finish() {
 		}
 	}
 	s.closeBlock()
+	s.closeTools()
 	if s.stopReason == "" {
 		s.stopReason = "end_turn"
 	}

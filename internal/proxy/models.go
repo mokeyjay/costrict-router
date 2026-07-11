@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"costrict-router/internal/catalog"
 	"costrict-router/internal/config"
 	"costrict-router/internal/i18n"
 	"costrict-router/internal/version"
@@ -276,32 +277,32 @@ func convertToAnthropicModelsFormat(body []byte) ([]byte, bool) {
 
 	// 上游模型项（OpenAI 风格）
 	type upstreamModel struct {
-		ID                    string `json:"id"`
-		Object                string `json:"object,omitempty"`
-		Created               int64  `json:"created,omitempty"`
-		OwnedBy               string `json:"owned_by,omitempty"`
-		ContextWindow         int    `json:"contextWindow,omitempty"`
-		MaxTokens             int    `json:"maxTokens,omitempty"`
-		DisplayName           string `json:"display_name,omitempty"`
-		Description           string `json:"description,omitempty"`
-		MaxTokensKey          string `json:"maxTokensKey,omitempty"`
-		SupportsImages        bool   `json:"supportsImages,omitempty"`
-		SupportsComputerUse   bool   `json:"supportsComputerUse,omitempty"`
-		SupportsPromptCache   bool   `json:"supportsPromptCache,omitempty"`
-		SupportsReasoningBudget bool  `json:"supportsReasoningBudget,omitempty"`
-		RequiredReasoningBudget bool `json:"requiredReasoningBudget,omitempty"`
-		CreditConsumption     int    `json:"creditConsumption,omitempty"`
-		CreditDiscount        int    `json:"creditDiscount,omitempty"`
+		ID                      string `json:"id"`
+		Object                  string `json:"object,omitempty"`
+		Created                 int64  `json:"created,omitempty"`
+		OwnedBy                 string `json:"owned_by,omitempty"`
+		ContextWindow           int    `json:"contextWindow,omitempty"`
+		MaxTokens               int    `json:"maxTokens,omitempty"`
+		DisplayName             string `json:"display_name,omitempty"`
+		Description             string `json:"description,omitempty"`
+		MaxTokensKey            string `json:"maxTokensKey,omitempty"`
+		SupportsImages          bool   `json:"supportsImages,omitempty"`
+		SupportsComputerUse     bool   `json:"supportsComputerUse,omitempty"`
+		SupportsPromptCache     bool   `json:"supportsPromptCache,omitempty"`
+		SupportsReasoningBudget bool   `json:"supportsReasoningBudget,omitempty"`
+		RequiredReasoningBudget bool   `json:"requiredReasoningBudget,omitempty"`
+		CreditConsumption       int    `json:"creditConsumption,omitempty"`
+		CreditDiscount          int    `json:"creditDiscount,omitempty"`
 	}
 
 	// Anthropic 风格模型项
 	type anthropicModel struct {
-		ID              string `json:"id"`
-		Type            string `json:"type"`
-		DisplayName     string `json:"display_name"`
-		CreatedAt       string `json:"created_at"`
-		MaxInputTokens  int    `json:"max_input_tokens"`
-		MaxTokens       int    `json:"max_tokens"`
+		ID             string `json:"id"`
+		Type           string `json:"type"`
+		DisplayName    string `json:"display_name"`
+		CreatedAt      string `json:"created_at"`
+		MaxInputTokens int    `json:"max_input_tokens"`
+		MaxTokens      int    `json:"max_tokens"`
 	}
 
 	var upstream []upstreamModel
@@ -358,6 +359,37 @@ func convertToAnthropicModelsFormat(body []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return bytes.TrimRight(buf.Bytes(), "\n"), true
+}
+
+// convertToCodexModelsFormat 把 CoStrict 的 OpenAI 列表转换为 Codex models manager
+// 当前要求的 {"models":[ModelInfo,...]} 结构，避免 Codex 因缺少 models 字段退回未知模型元数据。
+func convertToCodexModelsFormat(body []byte) ([]byte, bool) {
+	var payload struct {
+		Data []struct {
+			ID             string `json:"id"`
+			ContextWindow  int64  `json:"contextWindow"`
+			SupportsImages bool   `json:"supportsImages"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false
+	}
+	models := make([]catalog.SourceModel, 0, len(payload.Data))
+	for _, model := range payload.Data {
+		if model.ID == "" {
+			continue
+		}
+		models = append(models, catalog.SourceModel{
+			ID:             model.ID,
+			ContextWindow:  model.ContextWindow,
+			SupportsImages: model.SupportsImages,
+		})
+	}
+	out, err := catalog.Build(models).MarshalIndented()
+	if err != nil {
+		return nil, false
+	}
+	return bytes.TrimRight(out, "\n"), true
 }
 
 // replaceJSONModel 仅替换顶层 model 字段，其它字段以 json.RawMessage 原样保留（不重新转义内容）。

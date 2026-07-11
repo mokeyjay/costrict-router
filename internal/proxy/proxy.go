@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -184,6 +185,12 @@ func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec co
 	// 模型名，统一替换成兜底模型（用户配置的 fallback_model 或第一个可用模型），避免这些功能失败。
 	h.ensureModels(r.Context(), cfg)
 	chatBody = h.applyModelSubstitution(chatBody, cfg.FallbackModel)
+	chatBody, err = compat.ApplyUpstreamModelPolicy(chatBody)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	parallelToolCalls := compat.ChatParallelToolCalls(chatBody)
 
 	upstreamURL, err := joinURL(cfg.BaseURL, "/chat-rag/api/v1/chat/completions")
 	if err != nil {
@@ -210,9 +217,7 @@ func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec co
 	resp, err := h.httpClient().Do(req)
 	headersAt := time.Now()
 	if err != nil {
-		if h.Logger != nil {
-			h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
-		}
+		h.logUpstreamFailure(r, requestID, err)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
@@ -223,7 +228,7 @@ func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec co
 	var responseBody io.Reader = resp.Body
 	switch {
 	case status >= 200 && status < 300 && stream && outputFormat == "sse":
-		responseBody = codec.EncodeStream(resp.Body, modelName(chatBody))
+		responseBody = codec.EncodeStream(resp.Body, modelName(chatBody), parallelToolCalls)
 		copyTransformedResponseHeaders(w.Header(), resp.Header, "text/event-stream")
 		outputFormat = "sse"
 	case status >= 200 && status < 300:
@@ -232,7 +237,7 @@ func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec co
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", readErr.Error())
 			return
 		}
-		converted, convertErr := codec.EncodeResponse(upstreamBody)
+		converted, convertErr := codec.EncodeResponse(upstreamBody, parallelToolCalls)
 		if convertErr != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "proxy_error", convertErr.Error())
 			return
@@ -297,12 +302,19 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath s
 	var bodyBytes []byte
 	var chatSummary chatRequestSummary
 	// chat/completions 需读取 body 以替换未知模型；debug 模式也会读 body 用于摘要/日志。
-	needBody := r.Body != nil && ((isChatCompletion && h.Models != nil) || h.shouldInspectRequest(isChatCompletion))
+	needBody := r.Body != nil && (isChatCompletion || h.shouldInspectRequest(isChatCompletion))
 	if needBody {
 		bodyBytes, _ = io.ReadAll(r.Body)
 		if isChatCompletion && h.Models != nil {
 			h.ensureModels(r.Context(), cfg)
 			bodyBytes = h.applyModelSubstitution(bodyBytes, cfg.FallbackModel)
+		}
+		if isChatCompletion {
+			bodyBytes, err = compat.ApplyUpstreamModelPolicy(bodyBytes)
+			if err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
+			}
 		}
 		body = bytes.NewReader(bodyBytes)
 		if isChatCompletion {
@@ -327,9 +339,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath s
 	resp, err := h.httpClient().Do(req)
 	headersAt := time.Now()
 	if err != nil {
-		if h.Logger != nil {
-			h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
-		}
+		h.logUpstreamFailure(r, requestID, err)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
@@ -404,15 +414,20 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
-	// 仅对 Claude Code 改写模型列表，让上游模型出现在它的 /model 选择器。
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 && isAnthropicClient(r) {
-		if rewritten, ok := addClaudeModelAlias(body); ok {
-			body = rewritten
-		}
-		// Anthropic SDK 的 models.list() 要求 Anthropic 格式响应（type/created_at/max_input_tokens），
-		// 而上游返回的是 OpenAI 格式（object/created/contextWindow），必须转换。
-		if converted, ok := convertToAnthropicModelsFormat(body); ok {
-			body = converted
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		switch {
+		case isAnthropicClient(r):
+			if rewritten, ok := addClaudeModelAlias(body); ok {
+				body = rewritten
+			}
+			// Anthropic SDK 的 models.list() 要求 Anthropic 格式（type/created_at/max_input_tokens）。
+			if converted, ok := convertToAnthropicModelsFormat(body); ok {
+				body = converted
+			}
+		case isCodexClient(r):
+			if converted, ok := convertToCodexModelsFormat(body); ok {
+				body = converted
+			}
 		}
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
@@ -435,6 +450,13 @@ func isAnthropicClient(r *http.Request) bool {
 		return true
 	}
 	return strings.HasPrefix(r.Header.Get("User-Agent"), "claude-code/")
+}
+
+// isCodexClient 兼容 Codex CLI/App 的当前与历史 User-Agent，并接受其 originator 标识。
+func isCodexClient(r *http.Request) bool {
+	ua := strings.ToLower(r.Header.Get("User-Agent"))
+	originator := strings.ToLower(r.Header.Get("originator"))
+	return strings.Contains(ua, "codex_cli_rs/") || strings.HasPrefix(ua, "codex/") || strings.Contains(originator, "codex")
 }
 
 func (h *Handler) shouldInspectRequest(isChatCompletion bool) bool {
@@ -468,6 +490,19 @@ func (h *Handler) logChatMetrics(requestID string, r *http.Request, status int, 
 		resp.TokensPerSecond(),
 		valueOrNone(errorText),
 	)
+}
+
+// logUpstreamFailure 区分“客户端断开导致转发取消”与真正的上游错误：
+// 前者是客户端超时/主动取消的正常结果，记为 info，避免被误判为上游故障。
+func (h *Handler) logUpstreamFailure(r *http.Request, requestID string, err error) {
+	if h.Logger == nil {
+		return
+	}
+	if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+		h.Logger.Infof(i18n.T("client disconnected; upstream forward canceled method=%s path=%s request_id=%s", "客户端已断开，转发随之取消 method=%s path=%s request_id=%s"), r.Method, r.URL.Path, requestID)
+		return
+	}
+	h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
 }
 
 func applyCostrictHeaders(h http.Header, cfg config.Config, incoming *http.Request) {

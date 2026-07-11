@@ -99,7 +99,7 @@ func TestResponsesStreamSurfacesUpstreamError(t *testing.T) {
 		`data: [DONE]`,
 		"",
 	}, "\n\n")
-	out := readAll(t, (ResponsesCodec{}).EncodeStream(strings.NewReader(upstream), "m"))
+	out := readAll(t, (ResponsesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true))
 	if !strings.Contains(out, "event: response.failed") {
 		t.Fatalf("expected response.failed, got:\n%s", out)
 	}
@@ -287,7 +287,7 @@ func TestResponsesDecodeRejectsMissingInput(t *testing.T) {
 
 func TestResponsesEncodeResponse(t *testing.T) {
 	chat := `{"id":"chatcmpl-9","model":"glm-5","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`
-	out, err := (ResponsesCodec{}).EncodeResponse([]byte(chat))
+	out, err := (ResponsesCodec{}).EncodeResponse([]byte(chat), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +328,7 @@ func TestResponsesEncodeResponse(t *testing.T) {
 func TestResponsesUsageCarriesReasoningFromUpstream(t *testing.T) {
 	// 上游若提供 completion_tokens_details.reasoning_tokens / prompt_tokens_details.cached_tokens，应透传。
 	chat := `{"id":"x","model":"m","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":7}}}`
-	out, err := (ResponsesCodec{}).EncodeResponse([]byte(chat))
+	out, err := (ResponsesCodec{}).EncodeResponse([]byte(chat), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +351,7 @@ func TestResponsesEncodeStream(t *testing.T) {
 		`data: [DONE]`,
 		"",
 	}, "\n\n")
-	out := readAll(t, (ResponsesCodec{}).EncodeStream(strings.NewReader(upstream), "m"))
+	out := readAll(t, (ResponsesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true))
 	for _, want := range []string{
 		"event: response.created",
 		"event: response.output_item.added",
@@ -385,7 +385,7 @@ func TestResponsesEncodeStreamToolCall(t *testing.T) {
 		`data: [DONE]`,
 		"",
 	}, "\n\n")
-	out := readAll(t, (ResponsesCodec{}).EncodeStream(strings.NewReader(upstream), "m"))
+	out := readAll(t, (ResponsesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true))
 	for _, want := range []string{
 		`"type":"function_call"`,
 		`"call_id":"call_1"`,
@@ -397,6 +397,30 @@ func TestResponsesEncodeStreamToolCall(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in stream:\n%s", want, out)
+		}
+	}
+}
+
+func TestResponsesEncodeStreamInterleavedParallelToolCalls(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"f1","arguments":""}},{"index":1,"id":"call_2","type":"function","function":{"name":"f2","arguments":""}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":"}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"b\":"}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	out := readAll(t, (ResponsesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true))
+	if count := strings.Count(out, "event: response.output_item.added"); count != 2 {
+		t.Fatalf("output_item.added = %d:\n%s", count, out)
+	}
+	for _, want := range []string{
+		`"call_id":"call_1"`, `"name":"f1"`, `"arguments":"{\"a\":1}"`,
+		`"call_id":"call_2"`, `"name":"f2"`, `"arguments":"{\"b\":2}"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q:\n%s", want, out)
 		}
 	}
 }
@@ -461,5 +485,127 @@ func TestResponsesAssistantTextBetweenToolCallsAndOutputs(t *testing.T) {
 				t.Fatalf("tool_call %q 没有配对的 tool 响应;转换结果:\n%s", tc.ID, chatBody)
 			}
 		}
+	}
+}
+
+func TestResponsesDecodeTextFormatJSONSchema(t *testing.T) {
+	body := `{"model":"m","input":"hi","text":{"format":{"type":"json_schema","name":"agent_output","strict":true,"schema":{"type":"object","properties":{"ok":{"type":"string"}},"required":["ok"],"additionalProperties":false}}}}`
+	chatBody, _, err := (ResponsesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	rf, ok := chat["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("response_format missing: %s", chatBody)
+	}
+	if rf["type"] != "json_schema" {
+		t.Fatalf("type = %v", rf["type"])
+	}
+	js, ok := rf["json_schema"].(map[string]any)
+	if !ok {
+		t.Fatalf("json_schema missing: %s", chatBody)
+	}
+	if js["name"] != "agent_output" || js["strict"] != true {
+		t.Fatalf("json_schema = %v", js)
+	}
+	schema, ok := js["schema"].(map[string]any)
+	if !ok || schema["type"] != "object" {
+		t.Fatalf("schema = %v", js["schema"])
+	}
+}
+
+func TestResponsesDecodeTextFormatJSONObject(t *testing.T) {
+	chatBody, _, err := (ResponsesCodec{}).DecodeRequest([]byte(`{"model":"m","input":"hi","text":{"format":{"type":"json_object"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	rf, ok := chat["response_format"].(map[string]any)
+	if !ok || rf["type"] != "json_object" {
+		t.Fatalf("response_format = %v", chat["response_format"])
+	}
+}
+
+func TestResponsesDecodeTextFormatTextOmitted(t *testing.T) {
+	for _, body := range []string{
+		`{"model":"m","input":"hi","text":{"format":{"type":"text"}}}`,
+		`{"model":"m","input":"hi","text":{}}`,
+		`{"model":"m","input":"hi"}`,
+	} {
+		chatBody, _, err := (ResponsesCodec{}).DecodeRequest([]byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var chat map[string]any
+		if err := json.Unmarshal(chatBody, &chat); err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := chat["response_format"]; exists {
+			t.Fatalf("response_format should be omitted for %s: %s", body, chatBody)
+		}
+	}
+}
+
+func TestResponsesDecodeTextFormatRetainedBeforeModelPolicy(t *testing.T) {
+	// Decode 阶段完整保留，模型兜底替换完成后再按实际模型应用兼容策略。
+	body := `{"model":"m","input":"hi","tools":[{"type":"function","name":"f","parameters":{"type":"object"}}],"text":{"format":{"type":"json_schema","name":"o","schema":{"type":"object"}}}}`
+	chatBody, _, err := (ResponsesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := chat["response_format"]; !exists {
+		t.Fatalf("response_format should be retained before model policy: %s", chatBody)
+	}
+}
+
+func TestResponsesDecodeCarriesParallelAndStrict(t *testing.T) {
+	body := `{"model":"m","input":"hi","parallel_tool_calls":false,"tools":[{"type":"function","name":"f","strict":true,"parameters":{"type":"object"}}]}`
+	chatBody, _, err := (ResponsesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat chatRequest
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	if chat.ParallelToolCalls == nil || *chat.ParallelToolCalls {
+		t.Fatalf("parallel_tool_calls = %v", chat.ParallelToolCalls)
+	}
+	if len(chat.Tools) != 1 || chat.Tools[0].Function.Strict == nil || !*chat.Tools[0].Function.Strict {
+		t.Fatalf("strict 未透传: %s", chatBody)
+	}
+}
+
+func TestResponsesRejectsRemoteImageURL(t *testing.T) {
+	body := `{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"https://example.com/a.png"}]}]}`
+	_, _, err := (ResponsesCodec{}).DecodeRequest([]byte(body))
+	if apiErr := AsAPIError(err); apiErr == nil || apiErr.Status != 400 {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestResponsesParallelToolCallsReflectedInResponse(t *testing.T) {
+	chat := `{"id":"x","model":"m","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}]}`
+	out, err := (ResponsesCodec{}).EncodeResponse([]byte(chat), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(out, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["parallel_tool_calls"] != false {
+		t.Fatalf("parallel_tool_calls = %v", response["parallel_tool_calls"])
 	}
 }

@@ -40,6 +40,37 @@ func TestMessagesDecodeRequestBasic(t *testing.T) {
 	}
 }
 
+func TestMessagesDecodeDisableParallelToolUse(t *testing.T) {
+	body := `{
+		"model":"m","max_tokens":16,
+		"messages":[{"role":"user","content":"go"}],
+		"tools":[{"name":"f","input_schema":{"type":"object"}}],
+		"tool_choice":{"type":"auto","disable_parallel_tool_use":true}
+	}`
+	chatBody, _, err := (MessagesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat chatRequest
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	if chat.ParallelToolCalls == nil || *chat.ParallelToolCalls {
+		t.Fatalf("parallel_tool_calls = %v: %s", chat.ParallelToolCalls, chatBody)
+	}
+}
+
+func TestMessagesRejectsRemoteImageURL(t *testing.T) {
+	body := `{
+		"model":"m","max_tokens":16,
+		"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}]
+	}`
+	_, _, err := (MessagesCodec{}).DecodeRequest([]byte(body))
+	if apiErr := AsAPIError(err); apiErr == nil || apiErr.Status != 400 {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestMessagesDecodeToolResultBecomesToolMessage(t *testing.T) {
 	body := `{
 		"model":"m","max_tokens":16,
@@ -165,7 +196,7 @@ func TestMessagesDecodeToolResultImageBecomesFollowupUserMessage(t *testing.T) {
 
 func TestMessagesEncodeResponse(t *testing.T) {
 	chat := `{"id":"chatcmpl-7","model":"glm-5","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi there"}}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`
-	out, err := (MessagesCodec{}).EncodeResponse([]byte(chat))
+	out, err := (MessagesCodec{}).EncodeResponse([]byte(chat), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +222,7 @@ func TestMessagesEncodeResponse(t *testing.T) {
 
 func TestMessagesEncodeResponseToolUse(t *testing.T) {
 	chat := `{"id":"x","model":"m","choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]}}]}`
-	out, err := (MessagesCodec{}).EncodeResponse([]byte(chat))
+	out, err := (MessagesCodec{}).EncodeResponse([]byte(chat), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +250,7 @@ func TestMessagesEncodeStream(t *testing.T) {
 		`data: [DONE]`,
 		"",
 	}, "\n\n")
-	r := (MessagesCodec{}).EncodeStream(strings.NewReader(upstream), "m")
+	r := (MessagesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true)
 	out := readAll(t, r)
 	for _, want := range []string{
 		"event: message_start",
@@ -246,7 +277,7 @@ func TestMessagesEncodeStreamToolCall(t *testing.T) {
 		`data: [DONE]`,
 		"",
 	}, "\n\n")
-	out := readAll(t, (MessagesCodec{}).EncodeStream(strings.NewReader(upstream), "m"))
+	out := readAll(t, (MessagesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true))
 	for _, want := range []string{
 		`"type":"tool_use"`,
 		`"name":"f"`,
@@ -256,6 +287,33 @@ func TestMessagesEncodeStreamToolCall(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in stream:\n%s", want, out)
+		}
+	}
+}
+
+func TestMessagesEncodeStreamInterleavedParallelToolCalls(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"f1","arguments":""}},{"index":1,"id":"call_2","type":"function","function":{"name":"f2","arguments":""}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":"}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"b\":"}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+		`data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	out := readAll(t, (MessagesCodec{}).EncodeStream(strings.NewReader(upstream), "m", true))
+	if count := strings.Count(out, "event: content_block_start"); count != 2 {
+		t.Fatalf("content_block_start = %d:\n%s", count, out)
+	}
+	if count := strings.Count(out, "event: content_block_stop"); count != 2 {
+		t.Fatalf("content_block_stop = %d:\n%s", count, out)
+	}
+	for _, want := range []string{
+		`"id":"call_1"`, `"name":"f1"`, `"partial_json":"{\"a\":"`, `"partial_json":"1}"`,
+		`"id":"call_2"`, `"name":"f2"`, `"partial_json":"{\"b\":"`, `"partial_json":"2}"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q:\n%s", want, out)
 		}
 	}
 }

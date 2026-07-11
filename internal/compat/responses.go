@@ -28,7 +28,22 @@ type responsesRequest struct {
 	Stream             bool            `json:"stream"`
 	Tools              []responsesTool `json:"tools"`
 	ToolChoice         json.RawMessage `json:"tool_choice"`
+	ParallelToolCalls  *bool           `json:"parallel_tool_calls"`
 	PreviousResponseID string          `json:"previous_response_id"`
+	Text               *responsesText  `json:"text"`
+}
+
+type responsesText struct {
+	Format json.RawMessage `json:"format"`
+}
+
+// responsesTextFormat 是 text.format 的通用形状，同时覆盖
+// {"type":"json_object"} 与 {"type":"json_schema","name":...,"strict":...,"schema":{...}}。
+type responsesTextFormat struct {
+	Type   string          `json:"type"`
+	Name   string          `json:"name"`
+	Strict *bool           `json:"strict"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 type responsesTool struct {
@@ -36,6 +51,7 @@ type responsesTool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters"`
+	Strict      *bool           `json:"strict"`
 }
 
 type responsesInputItem struct {
@@ -70,11 +86,12 @@ func (ResponsesCodec) DecodeRequest(body []byte) ([]byte, bool, error) {
 	}
 
 	chat := chatRequest{
-		Model:       req.Model,
-		MaxTokens:   req.MaxOutputTokens,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Stream:      req.Stream,
+		Model:             req.Model,
+		MaxTokens:         req.MaxOutputTokens,
+		Temperature:       req.Temperature,
+		TopP:              req.TopP,
+		Stream:            req.Stream,
+		ParallelToolCalls: req.ParallelToolCalls,
 	}
 	if req.Stream {
 		chat.StreamOptions = &streamOptions{IncludeUsage: true}
@@ -103,11 +120,17 @@ func (ResponsesCodec) DecodeRequest(body []byte) ([]byte, bool, error) {
 				Name:        t.Name,
 				Description: t.Description,
 				Parameters:  t.Parameters,
+				Strict:      t.Strict,
 			},
 		})
 	}
 	if tc := responsesToolChoiceToChat(req.ToolChoice); tc != nil {
 		chat.ToolChoice = tc
+	}
+	// 先完整转换 text.format；模型特有的 tools + response_format 冲突在
+	// 模型兜底替换完成后由 ApplyUpstreamModelPolicy 统一处理。
+	if rf := responsesTextFormatToChat(req.Text); rf != nil {
+		chat.ResponseFormat = rf
 	}
 
 	out, err := jsonMarshal(chat)
@@ -163,10 +186,7 @@ func responsesInputToChat(raw json.RawMessage) ([]chatMessage, error) {
 				pendingReasoning = ""
 			}
 		case "function_call":
-			args := item.Arguments
-			if strings.TrimSpace(args) == "" {
-				args = "{}"
-			}
+			args := normalizeToolArguments(item.Arguments)
 			tc := chatToolCall{
 				ID:   item.CallID,
 				Type: "function",
@@ -188,10 +208,14 @@ func responsesInputToChat(raw json.RawMessage) ([]chatMessage, error) {
 				})
 			}
 		case "function_call_output":
+			content, err := responsesOutputContent(item.Output)
+			if err != nil {
+				return nil, err
+			}
 			out = append(out, chatMessage{
 				Role:       "tool",
 				ToolCallID: item.CallID,
-				Content:    responsesOutputContent(item.Output),
+				Content:    content,
 			})
 			pendingReasoning = "" // 工具结果开启新的上下文
 		case "reasoning":
@@ -263,7 +287,11 @@ func responsesMessageItemToChat(item responsesInputItem) (chatMessage, bool, err
 			textOnly.WriteString(p.Text)
 			chatParts = append(chatParts, chatContentPart{Type: "text", Text: p.Text})
 		case "input_image":
-			if url := responsesImageURL(p.ImageURL); url != "" {
+			url, err := responsesImageURL(p.ImageURL)
+			if err != nil {
+				return chatMessage{}, false, err
+			}
+			if url != "" {
 				hasNonText = true
 				chatParts = append(chatParts, chatContentPart{Type: "image_url", ImageURL: &chatImageURL{URL: url}})
 			}
@@ -292,35 +320,35 @@ func normalizeChatRole(role string) string {
 	}
 }
 
-func responsesImageURL(raw json.RawMessage) string {
+func responsesImageURL(raw json.RawMessage) (string, error) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return ""
+		return "", nil
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
+		return validateUpstreamImageURL(s)
 	}
 	// 也兼容对象形式 {"url":"..."}
 	var obj struct {
 		URL string `json:"url"`
 	}
 	if err := json.Unmarshal(raw, &obj); err == nil {
-		return obj.URL
+		return validateUpstreamImageURL(obj.URL)
 	}
-	return ""
+	return "", nil
 }
 
 // responsesOutputContent 把 function_call_output 的 output 转换成 Chat 工具消息的 content。
 // 纯文本时返回字符串；含图片（input_image，如 codex 的 view_image 结果）时返回多模态分片数组，
 // 否则图片会被丢弃，导致模型看不到工具返回的图片而产生幻觉。
-func responsesOutputContent(raw json.RawMessage) any {
+func responsesOutputContent(raw json.RawMessage) (any, error) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return ""
+		return "", nil
 	}
 	// 字符串形式：绝大多数工具结果都是纯文本，直接返回。
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
+		return s, nil
 	}
 	// 数组形式：可能夹带 input_image，逐项转换，含图片时保留为多模态数组。
 	var parts []responsesContentPart
@@ -334,18 +362,56 @@ func responsesOutputContent(raw json.RawMessage) any {
 				textOnly.WriteString(p.Text)
 				chatParts = append(chatParts, chatContentPart{Type: "text", Text: p.Text})
 			case "input_image":
-				if url := responsesImageURL(p.ImageURL); url != "" {
+				url, err := responsesImageURL(p.ImageURL)
+				if err != nil {
+					return nil, err
+				}
+				if url != "" {
 					hasImage = true
 					chatParts = append(chatParts, chatContentPart{Type: "image_url", ImageURL: &chatImageURL{URL: url}})
 				}
 			}
 		}
 		if hasImage {
-			return chatParts
+			return chatParts, nil
 		}
-		return textOnly.String()
+		return textOnly.String(), nil
 	}
-	return string(raw)
+	return string(raw), nil
+}
+
+// responsesTextFormatToChat 把 Responses 的 text.format 转换成 Chat Completions 的 response_format。
+// Responses 的 json_schema 是平铺形状（name/strict/schema 与 type 同级），
+// Chat Completions 则要求包在 json_schema 子对象里。type 为 text 或缺失时不设置，保持上游默认行为。
+func responsesTextFormatToChat(text *responsesText) any {
+	if text == nil || len(text.Format) == 0 || string(text.Format) == "null" {
+		return nil
+	}
+	var format responsesTextFormat
+	if err := json.Unmarshal(text.Format, &format); err != nil {
+		return nil
+	}
+	switch format.Type {
+	case "json_object":
+		return map[string]any{"type": "json_object"}
+	case "json_schema":
+		if len(format.Schema) == 0 || string(format.Schema) == "null" {
+			return nil
+		}
+		schema := map[string]any{
+			"name":   format.Name,
+			"schema": json.RawMessage(format.Schema),
+		}
+		if schema["name"] == "" {
+			schema["name"] = "response"
+		}
+		if format.Strict != nil {
+			schema["strict"] = *format.Strict
+		}
+		return map[string]any{"type": "json_schema", "json_schema": schema}
+	default:
+		return nil
+	}
 }
 
 func responsesToolChoiceToChat(raw json.RawMessage) any {
@@ -372,7 +438,7 @@ func responsesToolChoiceToChat(raw json.RawMessage) any {
 
 // ---- 响应方向: Chat Completions -> Responses ----
 
-func (ResponsesCodec) EncodeResponse(chatBody []byte) ([]byte, error) {
+func (ResponsesCodec) EncodeResponse(chatBody []byte, parallelToolCalls bool) ([]byte, error) {
 	var resp chatCompletionResponse
 	if err := json.Unmarshal(chatBody, &resp); err != nil {
 		return nil, fmt.Errorf("解析上游响应失败: %w", err)
@@ -413,10 +479,7 @@ func (ResponsesCodec) EncodeResponse(chatBody []byte) ([]byte, error) {
 			})
 		}
 		for _, tc := range choice.Message.ToolCalls {
-			args := tc.Function.Arguments
-			if strings.TrimSpace(args) == "" {
-				args = "{}"
-			}
+			args := normalizeToolArguments(tc.Function.Arguments)
 			output = append(output, map[string]any{
 				"type":      "function_call",
 				"id":        "fc_" + ids.UUID(),
@@ -444,7 +507,7 @@ func (ResponsesCodec) EncodeResponse(chatBody []byte) ([]byte, error) {
 		"usage":               responsesUsage(resp.Usage),
 		"error":               nil,
 		"metadata":            map[string]any{},
-		"parallel_tool_calls": true,
+		"parallel_tool_calls": parallelToolCalls,
 	}
 	if status == "incomplete" {
 		out["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
@@ -452,8 +515,8 @@ func (ResponsesCodec) EncodeResponse(chatBody []byte) ([]byte, error) {
 	return jsonMarshal(out)
 }
 
-func (ResponsesCodec) EncodeStream(r io.Reader, model string) io.Reader {
-	return encodeResponsesStream(r, model)
+func (ResponsesCodec) EncodeStream(r io.Reader, model string, parallelToolCalls bool) io.Reader {
+	return encodeResponsesStream(r, model, parallelToolCalls)
 }
 
 func (ResponsesCodec) EncodeError(status int, body []byte) []byte {

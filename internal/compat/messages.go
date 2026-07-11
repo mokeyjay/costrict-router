@@ -123,8 +123,12 @@ func (MessagesCodec) DecodeRequest(body []byte) ([]byte, bool, error) {
 			},
 		})
 	}
-	if tc := anthropicToolChoiceToChat(req.ToolChoice); tc != nil {
+	tc, parallel := anthropicToolChoiceToChat(req.ToolChoice)
+	if tc != nil {
 		chat.ToolChoice = tc
+	}
+	if parallel != nil {
+		chat.ParallelToolCalls = parallel
 	}
 
 	out, err := jsonMarshal(chat)
@@ -216,7 +220,11 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 				textBuf.WriteString(b.Text)
 			}
 		case "image":
-			if url := anthropicImageToURL(b.Source); url != "" {
+			url, err := anthropicImageToURL(b.Source)
+			if err != nil {
+				return nil, err
+			}
+			if url != "" {
 				parts = append(parts, chatContentPart{Type: "image_url", ImageURL: &chatImageURL{URL: url}})
 			}
 		case "thinking":
@@ -243,7 +251,10 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 		case "tool_result":
 			// tool_result 必须单独成为 tool 消息，先把已累积的内容刷出。
 			flushUserAssistant()
-			text, images := anthropicToolResultParts(b.Content)
+			text, images, err := anthropicToolResultParts(b.Content)
+			if err != nil {
+				return nil, err
+			}
 			if text == "" && len(images) > 0 {
 				// tool 消息内容不能为空，且图片要另发，这里放一句占位说明。
 				text = "[图片见后续消息]"
@@ -266,36 +277,36 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 	return out, nil
 }
 
-func anthropicImageToURL(src *anthropicSource) string {
+func anthropicImageToURL(src *anthropicSource) (string, error) {
 	if src == nil {
-		return ""
+		return "", nil
 	}
 	switch src.Type {
 	case "url":
-		return src.URL
+		return validateUpstreamImageURL(src.URL)
 	case "base64":
 		if src.Data == "" {
-			return ""
+			return "", nil
 		}
 		mt := src.MediaType
 		if mt == "" {
 			mt = "image/png"
 		}
-		return fmt.Sprintf("data:%s;base64,%s", mt, src.Data)
+		return fmt.Sprintf("data:%s;base64,%s", mt, src.Data), nil
 	}
-	return ""
+	return "", nil
 }
 
 // anthropicToolResultParts 拆分 tool_result 的 content（字符串或块数组），
 // 返回压平后的文本，以及其中携带的图片分片。Chat 的 tool 角色消息只能是字符串，
 // 图片需由调用方放到后续 user 消息里送给视觉模型。
-func anthropicToolResultParts(raw json.RawMessage) (string, []chatContentPart) {
+func anthropicToolResultParts(raw json.RawMessage) (string, []chatContentPart, error) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return "", nil
+		return "", nil, nil
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s, nil
+		return s, nil, nil
 	}
 	var blocks []anthropicBlock
 	if err := json.Unmarshal(raw, &blocks); err == nil {
@@ -306,49 +317,59 @@ func anthropicToolResultParts(raw json.RawMessage) (string, []chatContentPart) {
 			case "text":
 				parts = append(parts, b.Text)
 			case "image":
-				if url := anthropicImageToURL(b.Source); url != "" {
+				url, err := anthropicImageToURL(b.Source)
+				if err != nil {
+					return "", nil, err
+				}
+				if url != "" {
 					images = append(images, chatContentPart{Type: "image_url", ImageURL: &chatImageURL{URL: url}})
 				}
 			}
 		}
-		return strings.Join(parts, "\n"), images
+		return strings.Join(parts, "\n"), images, nil
 	}
-	return string(raw), nil
+	return string(raw), nil, nil
 }
 
-func anthropicToolChoiceToChat(raw json.RawMessage) any {
+func anthropicToolChoiceToChat(raw json.RawMessage) (any, *bool) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return nil
+		return nil, nil
 	}
 	var tc struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
+		Type                   string `json:"type"`
+		Name                   string `json:"name"`
+		DisableParallelToolUse *bool  `json:"disable_parallel_tool_use"`
 	}
 	if err := json.Unmarshal(raw, &tc); err != nil {
-		return nil
+		return nil, nil
+	}
+	var parallel *bool
+	if tc.DisableParallelToolUse != nil {
+		value := !*tc.DisableParallelToolUse
+		parallel = &value
 	}
 	switch tc.Type {
 	case "auto":
-		return "auto"
+		return "auto", parallel
 	case "any":
-		return "required"
+		return "required", parallel
 	case "none":
-		return "none"
+		return "none", parallel
 	case "tool":
 		if tc.Name == "" {
-			return nil
+			return nil, parallel
 		}
 		return map[string]any{
 			"type":     "function",
 			"function": map[string]any{"name": tc.Name},
-		}
+		}, parallel
 	}
-	return nil
+	return nil, parallel
 }
 
 // ---- 响应方向: Chat Completions -> Anthropic Messages ----
 
-func (MessagesCodec) EncodeResponse(chatBody []byte) ([]byte, error) {
+func (MessagesCodec) EncodeResponse(chatBody []byte, _ bool) ([]byte, error) {
 	var resp chatCompletionResponse
 	if err := json.Unmarshal(chatBody, &resp); err != nil {
 		return nil, fmt.Errorf("解析上游响应失败: %w", err)
@@ -405,7 +426,7 @@ func (MessagesCodec) EncodeResponse(chatBody []byte) ([]byte, error) {
 	return jsonMarshal(msg)
 }
 
-func (MessagesCodec) EncodeStream(r io.Reader, model string) io.Reader {
+func (MessagesCodec) EncodeStream(r io.Reader, model string, _ bool) io.Reader {
 	return encodeAnthropicStream(r, model)
 }
 
@@ -453,12 +474,5 @@ func anthropicMessageID(chatID string) string {
 }
 
 func rawJSONOrEmptyObject(s string) json.RawMessage {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return json.RawMessage("{}")
-	}
-	if !json.Valid([]byte(s)) {
-		return json.RawMessage("{}")
-	}
-	return json.RawMessage(s)
+	return json.RawMessage(normalizeToolArguments(s))
 }
