@@ -110,14 +110,17 @@ func (MessagesCodec) DecodeRequest(body []byte) ([]byte, bool, error) {
 	}
 
 	// tools
+	var droppedToolTypes []string
 	for _, t := range req.Tools {
 		// Anthropic server tool（web_search_20250305 等）由 Anthropic 服务端执行，
 		// 没有 input_schema，上游也不支持；转成无参 function 只会诱发无效调用，跳过。
 		// 自定义工具的 type 为空或 "custom"。
 		if t.Type != "" && t.Type != "custom" {
+			droppedToolTypes = append(droppedToolTypes, t.Type)
 			continue
 		}
 		if t.Name == "" {
+			droppedToolTypes = append(droppedToolTypes, "unnamed")
 			continue
 		}
 		chat.Tools = append(chat.Tools, chatTool{
@@ -129,12 +132,21 @@ func (MessagesCodec) DecodeRequest(body []byte) ([]byte, bool, error) {
 			},
 		})
 	}
-	tc, parallel := anthropicToolChoiceToChat(req.ToolChoice)
-	if tc != nil {
-		chat.ToolChoice = tc
+	// 工具全部被剔除时必须显式报错：Claude Code 的 WebSearch 会发只带
+	// web_search server tool 的子请求，静默剔除会让模型在“被暗示搜索却无工具”
+	// 的处境下幻觉输出原生工具标记，被客户端当成真实搜索结果回喂。
+	if len(req.Tools) > 0 && len(chat.Tools) == 0 {
+		return nil, false, errAllToolsDropped(droppedToolTypes)
 	}
-	if parallel != nil {
-		chat.ParallelToolCalls = parallel
+	// tool_choice 只在还有工具时下发，避免“有 tool_choice 无 tools”的组合触发上游校验。
+	if len(chat.Tools) > 0 {
+		tc, parallel := anthropicToolChoiceToChat(req.ToolChoice)
+		if tc != nil {
+			chat.ToolChoice = tc
+		}
+		if parallel != nil {
+			chat.ParallelToolCalls = parallel
+		}
 	}
 
 	out, err := jsonMarshal(chat)

@@ -183,28 +183,40 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 // 先把客户端请求体翻译成 Chat Completions，转发到上游，再把响应翻译回客户端协议。
 func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec compat.Codec) {
 	start := time.Now()
+	// 转换入口的本地错误按客户端协议输出信封：/v1/messages 用 Anthropic 形状，
+	// /v1/responses 用 OpenAI 形状，避免客户端 SDK 解析错误体失败。
+	writeErr := func(status int, typ, message string) {
+		if codec.Name() == "messages" {
+			writeAnthropicError(w, status, typ, message)
+			return
+		}
+		writeOpenAIError(w, status, typ, message)
+	}
+	writeAPIErr := func(err error, fallbackStatus int, fallbackType string) {
+		if apiErr := compat.AsAPIError(err); apiErr != nil {
+			writeErr(apiErr.Status, apiErr.Type, apiErr.Message)
+			return
+		}
+		writeErr(fallbackStatus, fallbackType, err.Error())
+	}
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		writeErr(http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	chatBody, stream, err := codec.DecodeRequest(bodyBytes)
 	if err != nil {
-		if apiErr := compat.AsAPIError(err); apiErr != nil {
-			writeOpenAIError(w, apiErr.Status, apiErr.Type, apiErr.Message)
-			return
-		}
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		writeAPIErr(err, http.StatusBadRequest, "invalid_request_error")
 		return
 	}
 
 	if err := h.Tokens.EnsureFreshToken(r.Context()); err != nil {
-		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", err.Error())
+		writeErr(http.StatusUnauthorized, "authentication_error", err.Error())
 		return
 	}
 	cfg := h.Tokens.Config()
 	if !cfg.LoggedIn() {
-		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
+		writeErr(http.StatusUnauthorized, "authentication_error", i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
 		return
 	}
 
@@ -214,7 +226,7 @@ func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec co
 	chatBody = h.applyModelSubstitution(chatBody, cfg.FallbackModel)
 	chatBody, err = compat.ApplyUpstreamModelPolicy(chatBody, cfg.ModelPolicyOverrides)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		writeErr(http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	parallelToolCalls := compat.ChatParallelToolCalls(chatBody)
@@ -403,6 +415,17 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath s
 			bodyBytes = h.applyModelSubstitution(bodyBytes, cfg.FallbackModel)
 		}
 		if isChatCompletion {
+			// 剔除上游不支持的工具类型（如 GLM 式 web_search），全部被剔除时给出明确错误，
+			// 避免上游整单拒绝时只返回含混的 channel_error。
+			bodyBytes, err = compat.SanitizeChatTools(bodyBytes)
+			if err != nil {
+				if apiErr := compat.AsAPIError(err); apiErr != nil {
+					writeOpenAIError(w, apiErr.Status, apiErr.Type, apiErr.Message)
+					return
+				}
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
+			}
 			bodyBytes, err = compat.ApplyUpstreamModelPolicy(bodyBytes, cfg.ModelPolicyOverrides)
 			if err != nil {
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())

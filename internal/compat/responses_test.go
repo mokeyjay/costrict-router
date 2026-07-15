@@ -609,3 +609,13 @@ func TestResponsesParallelToolCallsReflectedInResponse(t *testing.T) {
 		t.Fatalf("parallel_tool_calls = %v", response["parallel_tool_calls"])
 	}
 }
+
+// 回归：Responses 请求只带内置工具（web_search 等）时显式报错而非静默剔除。
+func TestResponsesDecodeAllBuiltinToolsDroppedErrors(t *testing.T) {
+	body := `{"model":"m","input":"hi","tools":[{"type":"web_search"}]}`
+	_, _, err := (ResponsesCodec{}).DecodeRequest([]byte(body))
+	apiErr := AsAPIError(err)
+	if apiErr == nil || apiErr.Status != 400 {
+		t.Fatalf("err = %v", err)
+	}
+}

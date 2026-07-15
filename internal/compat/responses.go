@@ -106,12 +106,15 @@ func (ResponsesCodec) DecodeRequest(body []byte) ([]byte, bool, error) {
 	}
 	chat.Messages = append(chat.Messages, msgs...)
 
+	var droppedToolTypes []string
 	for _, t := range req.Tools {
 		if t.Type != "" && t.Type != "function" {
-			// 仅支持 function 工具，内置工具（web_search 等）上游不支持，忽略。
+			// 仅支持 function 工具，内置工具（web_search 等）上游不支持，剔除。
+			droppedToolTypes = append(droppedToolTypes, t.Type)
 			continue
 		}
 		if t.Name == "" {
+			droppedToolTypes = append(droppedToolTypes, "unnamed")
 			continue
 		}
 		chat.Tools = append(chat.Tools, chatTool{
@@ -124,8 +127,15 @@ func (ResponsesCodec) DecodeRequest(body []byte) ([]byte, bool, error) {
 			},
 		})
 	}
-	if tc := responsesToolChoiceToChat(req.ToolChoice); tc != nil {
-		chat.ToolChoice = tc
+	// 工具全部被剔除时显式报错，避免模型在“被暗示用工具却无工具”时幻觉输出。
+	if len(req.Tools) > 0 && len(chat.Tools) == 0 {
+		return nil, false, errAllToolsDropped(droppedToolTypes)
+	}
+	// tool_choice 只在还有工具时下发。
+	if len(chat.Tools) > 0 {
+		if tc := responsesToolChoiceToChat(req.ToolChoice); tc != nil {
+			chat.ToolChoice = tc
+		}
 	}
 	// 先完整转换 text.format；模型特有的 tools + response_format 冲突在
 	// 模型兜底替换完成后由 ApplyUpstreamModelPolicy 统一处理。

@@ -518,3 +518,38 @@ func TestMessagesEncodeStreamTextAfterToolCallDropsLateArgs(t *testing.T) {
 		t.Fatalf("content_block_start = %d:\n%s", count, out)
 	}
 }
+
+// 回归：Claude Code WebSearch 子请求只带 web_search server tool，全剔除必须显式报错，
+// 否则模型会在“被暗示搜索却无工具”时幻觉输出原生工具标记，被当成搜索结果回喂。
+func TestMessagesDecodeAllServerToolsDroppedErrors(t *testing.T) {
+	body := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}],"tool_choice":{"type":"auto"},"tools":[{"type":"web_search_20250305","name":"web_search"}]}`
+	_, _, err := (MessagesCodec{}).DecodeRequest([]byte(body))
+	apiErr := AsAPIError(err)
+	if apiErr == nil || apiErr.Status != 400 {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(apiErr.Message, "web_search_20250305") {
+		t.Fatalf("错误信息应包含被剔除类型: %s", apiErr.Message)
+	}
+}
+
+func TestMessagesDecodeServerToolMixedIsFiltered(t *testing.T) {
+	body := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"f","input_schema":{"type":"object"}}]}`
+	out, _, err := (MessagesCodec{}).DecodeRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat struct {
+		Tools []struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.Tools) != 1 || chat.Tools[0].Function.Name != "f" {
+		t.Fatalf("tools = %+v", chat.Tools)
+	}
+}
