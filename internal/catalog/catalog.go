@@ -10,6 +10,7 @@ package catalog
 import (
 	_ "embed"
 	"encoding/json"
+	"strings"
 )
 
 // codexBaseInstructions 是 codex 自带的编码 agent 系统提示（models-manager/prompt.md 的快照）。
@@ -95,7 +96,7 @@ func Build(models []SourceModel) ModelsResponse {
 			DefaultReasoningSummary:       "auto",
 			SupportVerbosity:              false,
 			TruncationPolicy:              TruncationPolicy{Mode: "bytes", Limit: 10_000},
-			SupportsParallelToolCalls:     false,
+			SupportsParallelToolCalls:     supportsParallelToolCalls(m.ID),
 			ContextWindow:                 ctx,
 			MaxContextWindow:              ctx,
 			EffectiveContextWindowPercent: 95,
@@ -104,6 +105,13 @@ func Build(models []SourceModel) ModelsResponse {
 		})
 	}
 	return ModelsResponse{Models: out}
+}
+
+// supportsParallelToolCalls 只为已经真实验证过的模型开启 Codex 并行工具能力。
+// 新模型默认关闭，避免把未知上游能力误报给 Agent。
+func supportsParallelToolCalls(model string) bool {
+	model = strings.ToLower(model)
+	return strings.Contains(model, "glm") || strings.Contains(model, "minimax")
 }
 
 // MarshalJSON 生成可写入文件的缩进 JSON（带末尾换行）。

@@ -404,24 +404,33 @@ func TestModelsAliasOnlyForAnthropicClient(t *testing.T) {
 		t.Fatalf("Content-Length=%q 与实际 body 长度 %d 不一致", cl, len(rec.Body.Bytes()))
 	}
 
-	// 其它工具（无 anthropic-version、非 claude-code UA）：原样返回 OpenAI 格式，不加前缀。
+	// Codex 客户端：转换为当前 models manager 要求的 {"models":[...]} 格式，不加 Claude 前缀。
 	req2 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	req2.Header.Set("User-Agent", "codex/1.0")
+	req2.Header.Set("User-Agent", "codex_cli_rs/0.135.0")
 	rec2 := httptest.NewRecorder()
 	newHandler().ServeHTTP(rec2, req2)
 	body2 := rec2.Body.String()
 	if strings.Contains(body2, "claude-") {
-		t.Fatalf("非 Claude 客户端不应被改写: %s", body2)
+		t.Fatalf("Codex 客户端不应使用 Claude 别名: %s", body2)
 	}
-	if !strings.Contains(body2, `"id":"Tencent-glm-5.1"`) {
-		t.Fatalf("非 Claude 客户端应原样返回: %s", body2)
+	if !strings.Contains(body2, `"slug": "Tencent-glm-5.1"`) {
+		t.Fatalf("Codex 模型列表缺少真实模型: %s", body2)
 	}
-	// 非 Anthropic 客户端应保留 OpenAI 格式
-	if !strings.Contains(body2, `"object":"model"`) {
-		t.Fatalf("非 Claude 客户端应保留 OpenAI 格式 object: %s", body2)
+	if !strings.Contains(body2, `"models"`) {
+		t.Fatalf("Codex 格式应包含 models: %s", body2)
 	}
-	if strings.Contains(body2, `"type":"model"`) {
-		t.Fatalf("非 Claude 客户端不应有 Anthropic 格式 type: %s", body2)
+	if strings.Contains(body2, `"object":"model"`) || strings.Contains(body2, `"data"`) {
+		t.Fatalf("Codex 格式不应保留 OpenAI 列表信封: %s", body2)
+	}
+
+	// 普通 OpenAI 客户端仍收到标准 data/object 列表，避免 Codex 专用格式污染通用接口。
+	req3 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req3.Header.Set("User-Agent", "openai-go/1.0")
+	rec3 := httptest.NewRecorder()
+	newHandler().ServeHTTP(rec3, req3)
+	body3 := rec3.Body.String()
+	if !strings.Contains(body3, `"data"`) || !strings.Contains(body3, `"object":"model"`) {
+		t.Fatalf("OpenAI 客户端应保留标准列表格式: %s", body3)
 	}
 }
 

@@ -34,6 +34,9 @@ func TestBuild(t *testing.T) {
 	if first.ContextWindow != 198000 || first.MaxContextWindow != 198000 {
 		t.Fatalf("context_window 应为上游真实值 198000, got=%d/%d", first.ContextWindow, first.MaxContextWindow)
 	}
+	if !first.SupportsParallelToolCalls || resp.Models[1].SupportsParallelToolCalls {
+		t.Fatalf("并行工具能力应仅对已验证模型开启: glm=%t kimi=%t", first.SupportsParallelToolCalls, resp.Models[1].SupportsParallelToolCalls)
+	}
 	// 不支持图片：input_modalities 仅 text。
 	if len(first.InputModalities) != 1 || first.InputModalities[0] != "text" {
 		t.Fatalf("不支持图片应只有 text, got=%v", first.InputModalities)

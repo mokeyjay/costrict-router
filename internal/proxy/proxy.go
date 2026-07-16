@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"costrict-router/internal/compat"
@@ -63,6 +65,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.forwardCompat(w, r, compat.MessagesCodec{})
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages/count_tokens":
+		if !h.authorizeLocalAPIKey(w, r) {
+			return
+		}
+		h.handleCountTokens(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		if !h.authorizeLocalAPIKey(w, r) {
 			return
@@ -151,32 +158,65 @@ func localAPIKeyFromRequest(r *http.Request) string {
 	return apiKey
 }
 
+// handleCountTokens 本地估算 Anthropic count_tokens 请求。上游没有对应接口，
+// 而 Claude Code 会调它跟踪上下文用量；返回启发式估算值，避免 404 让客户端反复降级。
+func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	tokens, err := compat.EstimateMessagesTokens(body)
+	if err != nil {
+		if apiErr := compat.AsAPIError(err); apiErr != nil {
+			writeAnthropicError(w, apiErr.Status, apiErr.Type, apiErr.Message)
+			return
+		}
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": tokens})
+}
+
 // forwardCompat 处理需要协议转换的入口（/v1/responses、/v1/messages）：
 // 先把客户端请求体翻译成 Chat Completions，转发到上游，再把响应翻译回客户端协议。
 func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec compat.Codec) {
 	start := time.Now()
+	// 转换入口的本地错误按客户端协议输出信封：/v1/messages 用 Anthropic 形状，
+	// /v1/responses 用 OpenAI 形状，避免客户端 SDK 解析错误体失败。
+	writeErr := func(status int, typ, message string) {
+		if codec.Name() == "messages" {
+			writeAnthropicError(w, status, typ, message)
+			return
+		}
+		writeOpenAIError(w, status, typ, message)
+	}
+	writeAPIErr := func(err error, fallbackStatus int, fallbackType string) {
+		if apiErr := compat.AsAPIError(err); apiErr != nil {
+			writeErr(apiErr.Status, apiErr.Type, apiErr.Message)
+			return
+		}
+		writeErr(fallbackStatus, fallbackType, err.Error())
+	}
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		writeErr(http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	chatBody, stream, err := codec.DecodeRequest(bodyBytes)
 	if err != nil {
-		if apiErr := compat.AsAPIError(err); apiErr != nil {
-			writeOpenAIError(w, apiErr.Status, apiErr.Type, apiErr.Message)
-			return
-		}
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		writeAPIErr(err, http.StatusBadRequest, "invalid_request_error")
 		return
 	}
 
 	if err := h.Tokens.EnsureFreshToken(r.Context()); err != nil {
-		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", err.Error())
+		writeErr(http.StatusUnauthorized, "authentication_error", err.Error())
 		return
 	}
 	cfg := h.Tokens.Config()
 	if !cfg.LoggedIn() {
-		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
+		writeErr(http.StatusUnauthorized, "authentication_error", i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
 		return
 	}
 
@@ -184,6 +224,12 @@ func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec co
 	// 模型名，统一替换成兜底模型（用户配置的 fallback_model 或第一个可用模型），避免这些功能失败。
 	h.ensureModels(r.Context(), cfg)
 	chatBody = h.applyModelSubstitution(chatBody, cfg.FallbackModel)
+	chatBody, err = compat.ApplyUpstreamModelPolicy(chatBody, cfg.ModelPolicyOverrides)
+	if err != nil {
+		writeErr(http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	parallelToolCalls := compat.ChatParallelToolCalls(chatBody)
 
 	upstreamURL, err := joinURL(cfg.BaseURL, "/chat-rag/api/v1/chat/completions")
 	if err != nil {
@@ -207,32 +253,34 @@ func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec co
 			codec.Name(), requestID, r.Method, r.URL.Path, upstreamURL, logx.RedactHeader(req.Header), logx.TruncateBody(chatBody, 32*1024))
 	}
 
+	// 流式请求先向客户端提交 SSE 再连上游：上游 gateway 在发出响应头前就可能
+	// 缓冲数秒到一分钟以上，同步等待会让客户端按空闲超时断开。
+	if stream {
+		h.streamCompatResponse(w, r, codec, req, requestID, chatSummary, modelName(chatBody), parallelToolCalls, len(chatBody), start)
+		return
+	}
+
 	resp, err := h.httpClient().Do(req)
 	headersAt := time.Now()
 	if err != nil {
-		if h.Logger != nil {
-			h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
-		}
+		h.logUpstreamFailure(r, requestID, err)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
 	defer resp.Body.Close()
+	h.logAutoSelection(resp, requestID)
 
 	status := resp.StatusCode
 	outputFormat := responseFormat(resp.Header)
 	var responseBody io.Reader = resp.Body
 	switch {
-	case status >= 200 && status < 300 && stream && outputFormat == "sse":
-		responseBody = codec.EncodeStream(resp.Body, modelName(chatBody))
-		copyTransformedResponseHeaders(w.Header(), resp.Header, "text/event-stream")
-		outputFormat = "sse"
 	case status >= 200 && status < 300:
 		upstreamBody, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", readErr.Error())
 			return
 		}
-		converted, convertErr := codec.EncodeResponse(upstreamBody)
+		converted, convertErr := codec.EncodeResponse(upstreamBody, parallelToolCalls)
 		if convertErr != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "proxy_error", convertErr.Error())
 			return
@@ -270,6 +318,68 @@ func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec co
 	}
 }
 
+// streamCompatResponse 处理流式协议转换：立即向客户端提交 200 + SSE（编码器随即发出
+// 起始事件并周期保活），上游请求在后台进行。代价是上游错误只能以流内错误事件送达，
+// 无法再映射为 HTTP 状态码；上游响应头也不再透传（此时客户端头已发出）。
+func (h *Handler) streamCompatResponse(w http.ResponseWriter, r *http.Request, codec compat.Codec, req *http.Request, requestID string, chatSummary chatRequestSummary, model string, parallelToolCalls bool, requestBytes int, start time.Time) {
+	pr, pw := io.Pipe()
+	encoded := codec.EncodeStream(pr, model, parallelToolCalls)
+	// 客户端中途断开时 copyAndFlush 会停止消费；关闭编码器出口可解除其内部
+	// goroutine 的写阻塞，避免泄漏。
+	if closer, ok := encoded.(io.Closer); ok {
+		defer closer.Close()
+	}
+
+	var upstreamStatus atomic.Int64
+	go func() {
+		defer pw.Close()
+		resp, err := h.httpClient().Do(req)
+		if err != nil {
+			h.logUpstreamFailure(r, requestID, err)
+			_, _ = pw.Write(compat.UpstreamErrorSSE(0, []byte(err.Error())))
+			return
+		}
+		defer resp.Body.Close()
+		upstreamStatus.Store(int64(resp.StatusCode))
+		h.logAutoSelection(resp, requestID)
+		switch {
+		case resp.StatusCode < 200 || resp.StatusCode >= 300:
+			body, _ := io.ReadAll(resp.Body)
+			if h.Logger != nil {
+				h.Logger.Warnf(i18n.T("upstream returned error method=%s path=%s status=%d request_id=%s duration=%s", "上游返回错误 method=%s path=%s status=%d request_id=%s duration=%s"),
+					r.Method, r.URL.Path, resp.StatusCode, requestID, time.Since(start))
+			}
+			_, _ = pw.Write(compat.UpstreamErrorSSE(resp.StatusCode, body))
+		case responseFormat(resp.Header) != "sse":
+			// 上游没按流式返回（整体缓冲成 JSON），转成等价 SSE 块交给编码器。
+			body, _ := io.ReadAll(resp.Body)
+			_, _ = pw.Write(compat.ChatJSONToSSE(body))
+		default:
+			_, copyErr := io.Copy(pw, resp.Body)
+			if copyErr != nil {
+				_ = pw.CloseWithError(copyErr)
+			}
+		}
+	}()
+
+	var collector *responseMetricsCollector
+	responseBody := io.Reader(encoded)
+	if h.Logger != nil && h.Logger.DebugEnabled() {
+		collector = newResponseMetricsCollector(start, start, "sse")
+		responseBody = collector.wrap(responseBody)
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, copyErr := copyAndFlush(w, responseBody)
+	if h.Logger != nil && h.Logger.DebugEnabled() && collector != nil {
+		h.logChatMetrics(requestID, r, int(upstreamStatus.Load()), start, chatSummary, collector.finish(), requestBytes, copyErr)
+	}
+	if copyErr != nil && h.Logger != nil {
+		h.Logger.Warnf(i18n.T("failed to copy upstream response request_id=%s err=%v", "复制上游响应失败 request_id=%s err=%v"), requestID, copyErr)
+	}
+}
+
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath string, isChatCompletion bool) {
 	// 转发前确保 token 可用，再把 OpenAI 兼容路径映射到真实 CoStrict 上游接口。
 	start := time.Now()
@@ -297,12 +407,30 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath s
 	var bodyBytes []byte
 	var chatSummary chatRequestSummary
 	// chat/completions 需读取 body 以替换未知模型；debug 模式也会读 body 用于摘要/日志。
-	needBody := r.Body != nil && ((isChatCompletion && h.Models != nil) || h.shouldInspectRequest(isChatCompletion))
+	needBody := r.Body != nil && (isChatCompletion || h.shouldInspectRequest(isChatCompletion))
 	if needBody {
 		bodyBytes, _ = io.ReadAll(r.Body)
 		if isChatCompletion && h.Models != nil {
 			h.ensureModels(r.Context(), cfg)
 			bodyBytes = h.applyModelSubstitution(bodyBytes, cfg.FallbackModel)
+		}
+		if isChatCompletion {
+			// 剔除上游不支持的工具类型（如 GLM 式 web_search），全部被剔除时给出明确错误，
+			// 避免上游整单拒绝时只返回含混的 channel_error。
+			bodyBytes, err = compat.SanitizeChatTools(bodyBytes)
+			if err != nil {
+				if apiErr := compat.AsAPIError(err); apiErr != nil {
+					writeOpenAIError(w, apiErr.Status, apiErr.Type, apiErr.Message)
+					return
+				}
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
+			}
+			bodyBytes, err = compat.ApplyUpstreamModelPolicy(bodyBytes, cfg.ModelPolicyOverrides)
+			if err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
+			}
 		}
 		body = bytes.NewReader(bodyBytes)
 		if isChatCompletion {
@@ -327,13 +455,12 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath s
 	resp, err := h.httpClient().Do(req)
 	headersAt := time.Now()
 	if err != nil {
-		if h.Logger != nil {
-			h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
-		}
+		h.logUpstreamFailure(r, requestID, err)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
 	defer resp.Body.Close()
+	h.logAutoSelection(resp, requestID)
 
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
@@ -404,15 +531,20 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
-	// 仅对 Claude Code 改写模型列表，让上游模型出现在它的 /model 选择器。
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 && isAnthropicClient(r) {
-		if rewritten, ok := addClaudeModelAlias(body); ok {
-			body = rewritten
-		}
-		// Anthropic SDK 的 models.list() 要求 Anthropic 格式响应（type/created_at/max_input_tokens），
-		// 而上游返回的是 OpenAI 格式（object/created/contextWindow），必须转换。
-		if converted, ok := convertToAnthropicModelsFormat(body); ok {
-			body = converted
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		switch {
+		case isAnthropicClient(r):
+			if rewritten, ok := addClaudeModelAlias(body); ok {
+				body = rewritten
+			}
+			// Anthropic SDK 的 models.list() 要求 Anthropic 格式（type/created_at/max_input_tokens）。
+			if converted, ok := convertToAnthropicModelsFormat(body); ok {
+				body = converted
+			}
+		case isCodexClient(r):
+			if converted, ok := convertToCodexModelsFormat(body); ok {
+				body = converted
+			}
 		}
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
@@ -435,6 +567,13 @@ func isAnthropicClient(r *http.Request) bool {
 		return true
 	}
 	return strings.HasPrefix(r.Header.Get("User-Agent"), "claude-code/")
+}
+
+// isCodexClient 兼容 Codex CLI/App 的当前与历史 User-Agent，并接受其 originator 标识。
+func isCodexClient(r *http.Request) bool {
+	ua := strings.ToLower(r.Header.Get("User-Agent"))
+	originator := strings.ToLower(r.Header.Get("originator"))
+	return strings.Contains(ua, "codex_cli_rs/") || strings.HasPrefix(ua, "codex/") || strings.Contains(originator, "codex")
 }
 
 func (h *Handler) shouldInspectRequest(isChatCompletion bool) bool {
@@ -468,6 +607,19 @@ func (h *Handler) logChatMetrics(requestID string, r *http.Request, status int, 
 		resp.TokensPerSecond(),
 		valueOrNone(errorText),
 	)
+}
+
+// logUpstreamFailure 区分“客户端断开导致转发取消”与真正的上游错误：
+// 前者是客户端超时/主动取消的正常结果，记为 info，避免被误判为上游故障。
+func (h *Handler) logUpstreamFailure(r *http.Request, requestID string, err error) {
+	if h.Logger == nil {
+		return
+	}
+	if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+		h.Logger.Infof(i18n.T("client disconnected; upstream forward canceled method=%s path=%s request_id=%s", "客户端已断开，转发随之取消 method=%s path=%s request_id=%s"), r.Method, r.URL.Path, requestID)
+		return
+	}
+	h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
 }
 
 func applyCostrictHeaders(h http.Header, cfg config.Config, incoming *http.Request) {
@@ -584,6 +736,33 @@ func (h *Handler) httpClient() *http.Client {
 		return h.Client
 	}
 	return http.DefaultClient
+}
+
+// writeAnthropicError 输出 Anthropic 协议的错误信封（/v1/messages 系端点使用）。
+func writeAnthropicError(w http.ResponseWriter, status int, typ, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    typ,
+			"message": message,
+		},
+	})
+}
+
+// logAutoSelection 记录 Auto 模式实际选中的模型与原因（上游通过响应头返回）。
+// 响应头本身也会透传给客户端，这里补一条日志便于事后排查“这次为什么是这个模型”。
+func (h *Handler) logAutoSelection(resp *http.Response, requestID string) {
+	if h.Logger == nil || resp == nil {
+		return
+	}
+	selected := resp.Header.Get("x-select-llm")
+	if selected == "" {
+		return
+	}
+	h.Logger.Infof(i18n.T("Auto mode selected model=%s reason=%q request_id=%s", "Auto 模式选中 模型=%s 原因=%q request_id=%s"),
+		selected, resp.Header.Get("x-select-reason"), requestID)
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, typ, message string) {

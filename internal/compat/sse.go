@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
+	"time"
 )
 
 // sseEvent 表示一条 SSE 事件。
@@ -80,15 +82,49 @@ func chatStreamError(payload []byte) (string, bool) {
 	return "", false
 }
 
+// streamKeepaliveInterval 是流式空窗期间向客户端发送保活的间隔。
+// 上游 gateway 的缓冲窗口可长达一分钟以上（实测 TTFB 5-88s），思考中途也可能长时间无增量；
+// 周期性保活可避免客户端与中间代理按空闲超时断开连接。
+var streamKeepaliveInterval = 10 * time.Second
+
 // streamPipe 在 goroutine 中运行 generator 把转换后的 SSE 写入管道，返回可读端。
 // generator 内部用 write 回调输出字节，返回 error 会被忽略（流式场景尽力而为）。
-func streamPipe(generate func(write func([]byte) error) error) io.Reader {
+// keepalive 非空时，写入空窗超过 streamKeepaliveInterval 会自动补发保活字节。
+func streamPipe(keepalive []byte, generate func(write func([]byte) error) error) io.Reader {
 	pr, pw := io.Pipe()
+	var mu sync.Mutex
+	lastWrite := time.Now()
+	write := func(b []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		_, werr := pw.Write(b)
+		lastWrite = time.Now()
+		return werr
+	}
+	done := make(chan struct{})
+	if len(keepalive) > 0 {
+		go func() {
+			ticker := time.NewTicker(streamKeepaliveInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					mu.Lock()
+					if time.Since(lastWrite) >= streamKeepaliveInterval {
+						// 管道已关闭时写入报错，由 done 分支退出，这里忽略即可。
+						_, _ = pw.Write(keepalive)
+						lastWrite = time.Now()
+					}
+					mu.Unlock()
+				}
+			}
+		}()
+	}
 	go func() {
-		err := generate(func(b []byte) error {
-			_, werr := pw.Write(b)
-			return werr
-		})
+		err := generate(write)
+		close(done)
 		_ = pw.CloseWithError(err)
 	}()
 	return pr

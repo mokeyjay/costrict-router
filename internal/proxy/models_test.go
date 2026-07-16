@@ -180,10 +180,10 @@ func TestConvertToAnthropicModelsFormat(t *testing.T) {
 	}
 
 	var payload struct {
-		HasMore  *bool  `json:"has_more"`
-		FirstID  string `json:"first_id"`
-		LastID   string `json:"last_id"`
-		Data     []struct {
+		HasMore *bool  `json:"has_more"`
+		FirstID string `json:"first_id"`
+		LastID  string `json:"last_id"`
+		Data    []struct {
 			ID             string `json:"id"`
 			Type           string `json:"type"`
 			DisplayName    string `json:"display_name"`
@@ -265,8 +265,8 @@ func TestConvertToAnthropicModelsFormatEmptyList(t *testing.T) {
 		t.Fatal("空列表转换应成功")
 	}
 	var payload struct {
-		HasMore *bool  `json:"has_more"`
-		Data    []any  `json:"data"`
+		HasMore *bool `json:"has_more"`
+		Data    []any `json:"data"`
 	}
 	if err := json.Unmarshal(out, &payload); err != nil {
 		t.Fatalf("转换后不是合法 JSON: %v", err)

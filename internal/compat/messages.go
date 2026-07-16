@@ -110,8 +110,17 @@ func (MessagesCodec) DecodeRequest(body []byte) ([]byte, bool, error) {
 	}
 
 	// tools
+	var droppedToolTypes []string
 	for _, t := range req.Tools {
+		// Anthropic server tool（web_search_20250305 等）由 Anthropic 服务端执行，
+		// 没有 input_schema，上游也不支持；转成无参 function 只会诱发无效调用，跳过。
+		// 自定义工具的 type 为空或 "custom"。
+		if t.Type != "" && t.Type != "custom" {
+			droppedToolTypes = append(droppedToolTypes, t.Type)
+			continue
+		}
 		if t.Name == "" {
+			droppedToolTypes = append(droppedToolTypes, "unnamed")
 			continue
 		}
 		chat.Tools = append(chat.Tools, chatTool{
@@ -123,8 +132,21 @@ func (MessagesCodec) DecodeRequest(body []byte) ([]byte, bool, error) {
 			},
 		})
 	}
-	if tc := anthropicToolChoiceToChat(req.ToolChoice); tc != nil {
-		chat.ToolChoice = tc
+	// 工具全部被剔除时必须显式报错：Claude Code 的 WebSearch 会发只带
+	// web_search server tool 的子请求，静默剔除会让模型在“被暗示搜索却无工具”
+	// 的处境下幻觉输出原生工具标记，被客户端当成真实搜索结果回喂。
+	if len(req.Tools) > 0 && len(chat.Tools) == 0 {
+		return nil, false, errAllToolsDropped(droppedToolTypes)
+	}
+	// tool_choice 只在还有工具时下发，避免“有 tool_choice 无 tools”的组合触发上游校验。
+	if len(chat.Tools) > 0 {
+		tc, parallel := anthropicToolChoiceToChat(req.ToolChoice)
+		if tc != nil {
+			chat.ToolChoice = tc
+		}
+		if parallel != nil {
+			chat.ParallelToolCalls = parallel
+		}
 	}
 
 	out, err := jsonMarshal(chat)
@@ -156,7 +178,9 @@ func anthropicTextFromSystem(raw json.RawMessage) string {
 }
 
 // anthropicMessageToChat 把一条 Anthropic 消息转换成一条或多条 Chat 消息。
-// tool_result 块会被拆成独立的 tool 角色消息。
+// tool_result 块会被拆成独立的 tool 角色消息，且始终排在同一条消息的其他内容之前：
+// 上游要求 tool 结果紧跟 assistant 的 tool_calls，user 文本插在中间会报 "tool_call 没有响应"
+// （Anthropic 规范也要求 tool_result 位于消息开头，这里对不合规客户端做防御性重排）。
 func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 	// content 是纯字符串的简单情况。
 	var asString string
@@ -169,7 +193,7 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 		return nil, newAPIError(http.StatusBadRequest, "invalid_request_error", "解析消息内容失败: "+err.Error())
 	}
 
-	var out []chatMessage
+	var toolMsgs []chatMessage
 	var parts []chatContentPart
 	var toolCalls []chatToolCall
 	var textBuf strings.Builder
@@ -177,35 +201,6 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 	// tool_result 里的图片无法塞进 Chat 的 tool 角色消息（只能是字符串），
 	// 暂存到这里，循环结束后统一作为一条 user 消息补发给视觉模型。
 	var pendingToolImages []chatContentPart
-
-	flushUserAssistant := func() {
-		if m.Role == "assistant" {
-			if textBuf.Len() == 0 && len(toolCalls) == 0 {
-				return
-			}
-			msg := chatMessage{Role: "assistant"}
-			if textBuf.Len() > 0 {
-				msg.Content = textBuf.String()
-			}
-			// 回传 assistant 的思考内容：开启 thinking 的上游（如 kimi）要求带 tool_calls 的
-			// assistant 历史消息必须携带 reasoning_content，缺失会被拒绝（400 channel_error）。
-			if thinkBuf.Len() > 0 {
-				msg.ReasoningContent = thinkBuf.String()
-			}
-			msg.ToolCalls = toolCalls
-			out = append(out, msg)
-		} else {
-			if len(parts) > 0 {
-				out = append(out, chatMessage{Role: "user", Content: parts})
-			} else if textBuf.Len() > 0 {
-				out = append(out, chatMessage{Role: "user", Content: textBuf.String()})
-			}
-		}
-		textBuf.Reset()
-		thinkBuf.Reset()
-		parts = nil
-		toolCalls = nil
-	}
 
 	for _, b := range blocks {
 		switch b.Type {
@@ -216,7 +211,11 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 				textBuf.WriteString(b.Text)
 			}
 		case "image":
-			if url := anthropicImageToURL(b.Source); url != "" {
+			url, err := anthropicImageToURL(b.Source)
+			if err != nil {
+				return nil, err
+			}
+			if url != "" {
 				parts = append(parts, chatContentPart{Type: "image_url", ImageURL: &chatImageURL{URL: url}})
 			}
 		case "thinking":
@@ -241,14 +240,15 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 				},
 			})
 		case "tool_result":
-			// tool_result 必须单独成为 tool 消息，先把已累积的内容刷出。
-			flushUserAssistant()
-			text, images := anthropicToolResultParts(b.Content)
+			text, images, err := anthropicToolResultParts(b.Content)
+			if err != nil {
+				return nil, err
+			}
 			if text == "" && len(images) > 0 {
 				// tool 消息内容不能为空，且图片要另发，这里放一句占位说明。
 				text = "[图片见后续消息]"
 			}
-			out = append(out, chatMessage{
+			toolMsgs = append(toolMsgs, chatMessage{
 				Role:       "tool",
 				ToolCallID: b.ToolUseID,
 				Content:    text,
@@ -256,7 +256,30 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 			pendingToolImages = append(pendingToolImages, images...)
 		}
 	}
-	flushUserAssistant()
+
+	out := toolMsgs
+	if m.Role == "assistant" {
+		if textBuf.Len() > 0 || len(toolCalls) > 0 {
+			msg := chatMessage{Role: "assistant"}
+			if textBuf.Len() > 0 {
+				msg.Content = textBuf.String()
+			}
+			// 回传 assistant 的思考内容：开启 thinking 的上游（如 kimi）要求带 tool_calls 的
+			// assistant 历史消息必须携带 reasoning_content，缺失会被拒绝（400 channel_error）。
+			// 客户端没给思考块时补占位符（与 Responses 侧及官方扩展的常态防御一致）。
+			if len(toolCalls) > 0 {
+				msg.ReasoningContent = ensureToolReasoning(thinkBuf.String())
+			} else if thinkBuf.Len() > 0 {
+				msg.ReasoningContent = thinkBuf.String()
+			}
+			msg.ToolCalls = toolCalls
+			out = append(out, msg)
+		}
+	} else if len(parts) > 0 {
+		out = append(out, chatMessage{Role: "user", Content: flattenTextParts(parts)})
+	} else if textBuf.Len() > 0 {
+		out = append(out, chatMessage{Role: "user", Content: textBuf.String()})
+	}
 	// 把 tool_result 里的图片补成一条 user 消息，紧跟在 tool 消息之后送给视觉模型。
 	if len(pendingToolImages) > 0 {
 		parts := []chatContentPart{{Type: "text", Text: "以下是上面工具调用返回的图片："}}
@@ -266,36 +289,51 @@ func anthropicMessageToChat(m anthropicMessage) ([]chatMessage, error) {
 	return out, nil
 }
 
-func anthropicImageToURL(src *anthropicSource) string {
+// flattenTextParts 把纯文本分片压平成字符串（官方扩展同样如此，对非视觉上游更兼容）；
+// 含图片等非文本分片时保留数组形式。
+func flattenTextParts(parts []chatContentPart) any {
+	for _, p := range parts {
+		if p.Type != "text" {
+			return parts
+		}
+	}
+	texts := make([]string, 0, len(parts))
+	for _, p := range parts {
+		texts = append(texts, p.Text)
+	}
+	return strings.Join(texts, "\n")
+}
+
+func anthropicImageToURL(src *anthropicSource) (string, error) {
 	if src == nil {
-		return ""
+		return "", nil
 	}
 	switch src.Type {
 	case "url":
-		return src.URL
+		return validateUpstreamImageURL(src.URL)
 	case "base64":
 		if src.Data == "" {
-			return ""
+			return "", nil
 		}
 		mt := src.MediaType
 		if mt == "" {
 			mt = "image/png"
 		}
-		return fmt.Sprintf("data:%s;base64,%s", mt, src.Data)
+		return fmt.Sprintf("data:%s;base64,%s", mt, src.Data), nil
 	}
-	return ""
+	return "", nil
 }
 
 // anthropicToolResultParts 拆分 tool_result 的 content（字符串或块数组），
 // 返回压平后的文本，以及其中携带的图片分片。Chat 的 tool 角色消息只能是字符串，
 // 图片需由调用方放到后续 user 消息里送给视觉模型。
-func anthropicToolResultParts(raw json.RawMessage) (string, []chatContentPart) {
+func anthropicToolResultParts(raw json.RawMessage) (string, []chatContentPart, error) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return "", nil
+		return "", nil, nil
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s, nil
+		return s, nil, nil
 	}
 	var blocks []anthropicBlock
 	if err := json.Unmarshal(raw, &blocks); err == nil {
@@ -306,49 +344,59 @@ func anthropicToolResultParts(raw json.RawMessage) (string, []chatContentPart) {
 			case "text":
 				parts = append(parts, b.Text)
 			case "image":
-				if url := anthropicImageToURL(b.Source); url != "" {
+				url, err := anthropicImageToURL(b.Source)
+				if err != nil {
+					return "", nil, err
+				}
+				if url != "" {
 					images = append(images, chatContentPart{Type: "image_url", ImageURL: &chatImageURL{URL: url}})
 				}
 			}
 		}
-		return strings.Join(parts, "\n"), images
+		return strings.Join(parts, "\n"), images, nil
 	}
-	return string(raw), nil
+	return string(raw), nil, nil
 }
 
-func anthropicToolChoiceToChat(raw json.RawMessage) any {
+func anthropicToolChoiceToChat(raw json.RawMessage) (any, *bool) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return nil
+		return nil, nil
 	}
 	var tc struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
+		Type                   string `json:"type"`
+		Name                   string `json:"name"`
+		DisableParallelToolUse *bool  `json:"disable_parallel_tool_use"`
 	}
 	if err := json.Unmarshal(raw, &tc); err != nil {
-		return nil
+		return nil, nil
+	}
+	var parallel *bool
+	if tc.DisableParallelToolUse != nil {
+		value := !*tc.DisableParallelToolUse
+		parallel = &value
 	}
 	switch tc.Type {
 	case "auto":
-		return "auto"
+		return "auto", parallel
 	case "any":
-		return "required"
+		return "required", parallel
 	case "none":
-		return "none"
+		return "none", parallel
 	case "tool":
 		if tc.Name == "" {
-			return nil
+			return nil, parallel
 		}
 		return map[string]any{
 			"type":     "function",
 			"function": map[string]any{"name": tc.Name},
-		}
+		}, parallel
 	}
-	return nil
+	return nil, parallel
 }
 
 // ---- 响应方向: Chat Completions -> Anthropic Messages ----
 
-func (MessagesCodec) EncodeResponse(chatBody []byte) ([]byte, error) {
+func (MessagesCodec) EncodeResponse(chatBody []byte, _ bool) ([]byte, error) {
 	var resp chatCompletionResponse
 	if err := json.Unmarshal(chatBody, &resp); err != nil {
 		return nil, fmt.Errorf("解析上游响应失败: %w", err)
@@ -405,7 +453,7 @@ func (MessagesCodec) EncodeResponse(chatBody []byte) ([]byte, error) {
 	return jsonMarshal(msg)
 }
 
-func (MessagesCodec) EncodeStream(r io.Reader, model string) io.Reader {
+func (MessagesCodec) EncodeStream(r io.Reader, model string, _ bool) io.Reader {
 	return encodeAnthropicStream(r, model)
 }
 
@@ -453,12 +501,5 @@ func anthropicMessageID(chatID string) string {
 }
 
 func rawJSONOrEmptyObject(s string) json.RawMessage {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return json.RawMessage("{}")
-	}
-	if !json.Valid([]byte(s)) {
-		return json.RawMessage("{}")
-	}
-	return json.RawMessage(s)
+	return json.RawMessage(normalizeToolArguments(s))
 }

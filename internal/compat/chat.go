@@ -18,9 +18,9 @@ type Codec interface {
 	// DecodeRequest 把客户端请求体转换成 Chat Completions 请求体，并返回是否为流式请求。
 	DecodeRequest(body []byte) (chatBody []byte, stream bool, err error)
 	// EncodeResponse 把上游 Chat Completions 的 JSON 响应转换成客户端协议响应。
-	EncodeResponse(chatBody []byte) ([]byte, error)
+	EncodeResponse(chatBody []byte, parallelToolCalls bool) ([]byte, error)
 	// EncodeStream 把上游 Chat Completions 的 SSE 流转换成客户端协议的 SSE 流。
-	EncodeStream(r io.Reader, model string) io.Reader
+	EncodeStream(r io.Reader, model string, parallelToolCalls bool) io.Reader
 	// EncodeError 把上游错误体转换成客户端协议的错误信封。
 	EncodeError(status int, body []byte) []byte
 }
@@ -28,16 +28,18 @@ type Codec interface {
 // ---- Chat Completions 请求类型 ----
 
 type chatRequest struct {
-	Model         string         `json:"model"`
-	Messages      []chatMessage  `json:"messages"`
-	MaxTokens     *int           `json:"max_tokens,omitempty"`
-	Temperature   *float64       `json:"temperature,omitempty"`
-	TopP          *float64       `json:"top_p,omitempty"`
-	Stop          any            `json:"stop,omitempty"`
-	Stream        bool           `json:"stream,omitempty"`
-	StreamOptions *streamOptions `json:"stream_options,omitempty"`
-	Tools         []chatTool     `json:"tools,omitempty"`
-	ToolChoice    any            `json:"tool_choice,omitempty"`
+	Model             string         `json:"model"`
+	Messages          []chatMessage  `json:"messages"`
+	MaxTokens         *int           `json:"max_tokens,omitempty"`
+	Temperature       *float64       `json:"temperature,omitempty"`
+	TopP              *float64       `json:"top_p,omitempty"`
+	Stop              any            `json:"stop,omitempty"`
+	Stream            bool           `json:"stream,omitempty"`
+	StreamOptions     *streamOptions `json:"stream_options,omitempty"`
+	Tools             []chatTool     `json:"tools,omitempty"`
+	ToolChoice        any            `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool          `json:"parallel_tool_calls,omitempty"`
+	ResponseFormat    any            `json:"response_format,omitempty"`
 }
 
 type streamOptions struct {
@@ -74,6 +76,7 @@ type chatToolFunc struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
 }
 
 // 多模态内容分片，content 既可能是字符串，也可能是分片数组。
