@@ -14,6 +14,11 @@ type ModelPolicyOverride struct {
 	KeepResponseFormat bool `json:"keep_response_format,omitempty"`
 	// KeepTemperature 为 true 时不再在结构化输出时省略显式温度。
 	KeepTemperature bool `json:"keep_temperature,omitempty"`
+	// DisableThinking 为 true 时强制注入 thinking.type=disabled，关闭该模型的内置思考。
+	// 实测上游 CoStrict 网关支持智谱风格的 thinking 开关：一个视觉转写模型默认每次
+	// 生成 8 千字思考、占读图耗时的大半，关闭后同等转写准确率下耗时降为约 1/5。
+	// 仅对该开关已验证生效的模型配置；thinking 请求字段本身仍按原样透传。
+	DisableThinking bool `json:"disable_thinking,omitempty"`
 }
 
 // ApplyUpstreamModelPolicy 在模型兜底替换完成后应用 CoStrict 当前各模型的兼容策略。
@@ -73,6 +78,12 @@ func ApplyUpstreamModelPolicy(chatBody []byte, overrides map[string]ModelPolicyO
 		if hasResponseFormat && !ov.KeepTemperature {
 			delete(fields, "temperature")
 		}
+	}
+
+	// 思考开关与上面的兼容降级正交：任何模型都可能被配置，因此在模型分支之外统一处理。
+	// 覆盖请求里已有的 thinking 字段，override 的语义是"强制"。
+	if ov.DisableThinking {
+		fields["thinking"] = json.RawMessage(`{"type":"disabled"}`)
 	}
 
 	return jsonMarshal(fields)
