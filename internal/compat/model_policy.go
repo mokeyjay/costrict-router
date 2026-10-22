@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// ModelPolicyOverride 允许用户按模型关闭 Router 的某项默认兼容降级。
+// ModelPolicyOverride 允许用户按模型关闭 Router 的某项默认兼容降级，或强制关闭上游内置思考。
 // 上游修复限制的速度快于本工具的发版节奏，用户复查确认后改配置即可生效，无需等新版本。
 type ModelPolicyOverride struct {
 	// KeepToolChoice 为 true 时不再把 tool_choice=required/指定函数降级为 auto。
@@ -15,9 +15,8 @@ type ModelPolicyOverride struct {
 	// KeepTemperature 为 true 时不再在结构化输出时省略显式温度。
 	KeepTemperature bool `json:"keep_temperature,omitempty"`
 	// DisableThinking 为 true 时强制注入 thinking.type=disabled，关闭该模型的内置思考。
-	// 实测上游 CoStrict 网关支持智谱风格的 thinking 开关：一个视觉转写模型默认每次
-	// 生成 8 千字思考、占读图耗时的大半，关闭后同等转写准确率下耗时降为约 1/5。
-	// 仅对该开关已验证生效的模型配置；thinking 请求字段本身仍按原样透传。
+	// 并非所有模型都支持：2026-10-22 实测 Tencent-glm-5.1 会直接 400，Baidu-glm-5.3
+	// 会把思考混进正文；各模型结论见 docs/configuration.md。未配置时 thinking 字段原样透传。
 	DisableThinking bool `json:"disable_thinking,omitempty"`
 }
 
