@@ -10,10 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"costrict-router/internal/auth"
 	"costrict-router/internal/catalog"
 	"costrict-router/internal/config"
 	"costrict-router/internal/i18n"
-	"costrict-router/internal/version"
+	"costrict-router/internal/ids"
 )
 
 // claudeModelPrefix 是给 Claude Code 的模型别名前缀。Claude Code 的 gatewayDiscovery 只把
@@ -151,9 +152,10 @@ func (h *Handler) fetchModelIDs(ctx context.Context, cfg config.Config) ([]strin
 	if err != nil {
 		return nil, err
 	}
+	auth.ApplyDefaultHeaders(req.Header, cfg.PluginVersion)
 	req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
+	req.Header.Set("X-Request-ID", ids.UUID())
 	req.Header.Set("x-user-id", cfg.UserID)
-	req.Header.Set("User-Agent", "costrict-router/"+version.Current)
 	resp, err := h.httpClient().Do(req)
 	if err != nil {
 		return nil, err

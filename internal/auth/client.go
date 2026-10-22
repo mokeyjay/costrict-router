@@ -65,12 +65,8 @@ func (p LoginParams) WithDefaults() LoginParams {
 	if p.Provider == "" {
 		p.Provider = "casdoor"
 	}
-	if p.PluginVersion == "" {
-		p.PluginVersion = "2.8.1"
-	}
-	if p.VSCodeVersion == "" {
-		p.VSCodeVersion = "1.120.0"
-	}
+	p.PluginVersion = NormalizePluginVersion(p.PluginVersion)
+	p.VSCodeVersion = NormalizeVSCodeVersion(p.VSCodeVersion)
 	if p.URIScheme == "" {
 		p.URIScheme = "vscode"
 	}

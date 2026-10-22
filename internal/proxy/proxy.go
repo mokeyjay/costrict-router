@@ -10,18 +10,17 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"costrict-router/internal/auth"
 	"costrict-router/internal/compat"
 	"costrict-router/internal/config"
 	"costrict-router/internal/i18n"
 	"costrict-router/internal/ids"
 	"costrict-router/internal/logx"
-	"costrict-router/internal/version"
 )
 
 type TokenProvider interface {
@@ -630,8 +629,9 @@ func applyCostrictHeaders(h http.Header, cfg config.Config, incoming *http.Reque
 	h.Set("Accept-Language", firstHeader(incoming, "Accept-Language", "zh-CN"))
 	h.Set("HTTP-Referer", firstHeader(incoming, "HTTP-Referer", "https://github.com/RooVetGit/Roo-Cline"))
 	h.Set("X-Title", firstHeader(incoming, "X-Title", "Roo Code"))
-	h.Set("User-Agent", fmt.Sprintf("costrict-router/%s (%s/%s)", version.Current, runtime.GOOS, runtime.GOARCH))
-	h.Set("X-Costrict-Version", cfg.PluginVersion)
+	h.Set("User-Agent", auth.PluginUserAgent(cfg.PluginVersion))
+	h.Set("X-Costrict-Version", auth.NormalizePluginVersion(cfg.PluginVersion))
+	h.Set("x-costrict-idea", auth.EditorType)
 	h.Set("x-quota-identity", firstHeader(incoming, "x-quota-identity", "system"))
 	h.Set("X-Request-ID", requestID)
 	h.Set("zgsm-request-id", requestID)

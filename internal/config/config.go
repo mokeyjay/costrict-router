@@ -113,8 +113,8 @@ func Default() Config {
 		ListenAddr:    "127.0.0.1:14567",
 		MachineCode:   auth.GenerateMachineCode(),
 		Provider:      "casdoor",
-		PluginVersion: "2.8.1",
-		VSCodeVersion: "1.120.0",
+		PluginVersion: auth.DefaultPluginVersion,
+		VSCodeVersion: auth.DefaultVSCodeVersion,
 		URIScheme:     "vscode",
 	}
 	cfg.ApplyDefaults()
@@ -122,7 +122,7 @@ func Default() Config {
 }
 
 func (c *Config) ApplyDefaults() {
-	// 只补齐缺失字段，避免覆盖用户已经持久化的登录参数和偏好配置。
+	// 只补齐缺失字段，避免覆盖用户已经持久化的登录参数和偏好配置；插件和 VS Code 版本例外，低于内置版本时会升级。
 	if c.Version == 0 {
 		c.Version = 1
 	}
@@ -135,12 +135,8 @@ func (c *Config) ApplyDefaults() {
 	if c.Provider == "" {
 		c.Provider = "casdoor"
 	}
-	if c.PluginVersion == "" {
-		c.PluginVersion = "2.8.1"
-	}
-	if c.VSCodeVersion == "" {
-		c.VSCodeVersion = "1.120.0"
-	}
+	c.PluginVersion = auth.NormalizePluginVersion(c.PluginVersion)
+	c.VSCodeVersion = auth.NormalizeVSCodeVersion(c.VSCodeVersion)
 	if c.URIScheme == "" {
 		c.URIScheme = "vscode"
 	}
