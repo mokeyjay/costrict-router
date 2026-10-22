@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseLoginURL(t *testing.T) {
-	params, err := ParseLoginURL("https://www.abc.com/oidc-auth/api/v1/plugin/login?machine_code=m1&state=s1&provider=casdoor&plugin_version=2.8.1&vscode_version=1.120.0&uri_scheme=vscode")
+	params, err := ParseLoginURL("https://www.abc.com/oidc-auth/api/v1/plugin/login?machine_code=m1&state=s1&provider=casdoor&plugin_version=3.0.23&vscode_version=1.143.0&uri_scheme=vscode")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,5 +61,40 @@ func TestBuildLoginURLWithGeneratedValuesMatchesAPIDocShape(t *testing.T) {
 	}
 	if got := u.Query().Get("state"); got == "" || got == "d62571f4-ab1e-41db-9a1b-0ad3be5fb0ef" {
 		t.Fatalf("state = %q", got)
+	}
+}
+
+func TestNormalizePluginVersion(t *testing.T) {
+	// 旧配置里的历史版本号需要升级到内置版本，更高版本则按原样保留。
+	cases := map[string]string{
+		"":         DefaultPluginVersion,
+		"2.8.1":    DefaultPluginVersion,
+		"3.0.14":   DefaultPluginVersion,
+		"invalid":  DefaultPluginVersion,
+		" 3.0.23 ": "3.0.23",
+		"3.0.100":  "3.0.100",
+		"3.1":      "3.1",
+		"4.0.0":    "4.0.0",
+	}
+	for in, want := range cases {
+		if got := NormalizePluginVersion(in); got != want {
+			t.Errorf("NormalizePluginVersion(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNormalizeVSCodeVersion(t *testing.T) {
+	if got := NormalizeVSCodeVersion("1.120.0"); got != DefaultVSCodeVersion {
+		t.Fatalf("NormalizeVSCodeVersion(1.120.0) = %q", got)
+	}
+	if got := NormalizeVSCodeVersion("1.200.0"); got != "1.200.0" {
+		t.Fatalf("NormalizeVSCodeVersion(1.200.0) = %q", got)
+	}
+}
+
+func TestPluginUserAgent(t *testing.T) {
+	// 对齐扩展 costrict.ts 中对话请求的 User-Agent 格式。
+	if got := PluginUserAgent("2.8.1"); got != "RooCode/3.52.1 plugin_vscode/"+DefaultPluginVersion {
+		t.Fatalf("PluginUserAgent = %q", got)
 	}
 }

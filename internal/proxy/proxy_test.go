@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"costrict-router/internal/auth"
 	"costrict-router/internal/config"
 	"costrict-router/internal/logx"
 )
@@ -39,6 +40,16 @@ func TestForwardChatAddsCostrictHeaders(t *testing.T) {
 		}
 		if r.Header.Get("zgsm-client-id") != "machine" || r.Header.Get("x-user-id") != "user" {
 			t.Fatalf("headers = %+v", r.Header)
+		}
+		// 客户端身份头需与官方扩展一致；配置里没有版本号时回落到内置版本。
+		if got, want := r.Header.Get("User-Agent"), "RooCode/3.52.1 plugin_vscode/"+auth.DefaultPluginVersion; got != want {
+			t.Fatalf("User-Agent = %q, want %q", got, want)
+		}
+		if got := r.Header.Get("X-Costrict-Version"); got != auth.DefaultPluginVersion {
+			t.Fatalf("X-Costrict-Version = %q", got)
+		}
+		if got := r.Header.Get("x-costrict-idea"); got != "Visual Studio Code" {
+			t.Fatalf("x-costrict-idea = %q", got)
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK,

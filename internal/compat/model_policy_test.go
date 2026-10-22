@@ -122,3 +122,66 @@ func TestApplyUpstreamModelPolicyOverrides(t *testing.T) {
 		t.Fatalf("未命中的模型不应受覆盖影响: %v", request["tool_choice"])
 	}
 }
+
+func TestApplyUpstreamModelPolicyDisableThinking(t *testing.T) {
+	overrides := map[string]ModelPolicyOverride{
+		"tencent-kimi-k2.6": {DisableThinking: true},
+	}
+
+	tests := []struct {
+		name      string
+		body      string
+		overrides map[string]ModelPolicyOverride
+		want      any
+	}{
+		{
+			name:      "配置 disable_thinking 后注入关闭字段",
+			body:      `{"model":"Tencent-kimi-k2.6","messages":[]}`,
+			overrides: overrides,
+			want:      map[string]any{"type": "disabled"},
+		},
+		{
+			name:      "未配置时不注入",
+			body:      `{"model":"Tencent-kimi-k2.6","messages":[]}`,
+			overrides: nil,
+			want:      nil,
+		},
+		{
+			name:      "覆盖请求里已有的 thinking 字段",
+			body:      `{"model":"Tencent-kimi-k2.6","messages":[],"thinking":{"type":"enabled","budget_tokens":2048}}`,
+			overrides: overrides,
+			want:      map[string]any{"type": "disabled"},
+		},
+		{
+			name:      "未命中的模型不受影响",
+			body:      `{"model":"Baidu-glm-5.3","messages":[]}`,
+			overrides: overrides,
+			want:      nil,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			out, err := ApplyUpstreamModelPolicy([]byte(test.body), test.overrides)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var request map[string]any
+			if err := json.Unmarshal(out, &request); err != nil {
+				t.Fatal(err)
+			}
+			got := request["thinking"]
+			if test.want == nil {
+				if got != nil {
+					t.Fatalf("thinking 应不存在: %v", got)
+				}
+				return
+			}
+			wantJSON, _ := json.Marshal(test.want)
+			gotJSON, _ := json.Marshal(got)
+			if string(gotJSON) != string(wantJSON) {
+				t.Fatalf("thinking = %s, want %s", gotJSON, wantJSON)
+			}
+		})
+	}
+}

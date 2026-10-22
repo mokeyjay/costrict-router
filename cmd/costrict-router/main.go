@@ -554,7 +554,7 @@ func sendChatProbe(ctx context.Context, cfg config.Config, model, prompt string)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
-	req.Header.Set("User-Agent", "costrict-router/"+version.Current)
+	req.Header.Set("User-Agent", auth.PluginUserAgent(cfg.PluginVersion))
 	req.Header.Set("X-Request-ID", requestID)
 	req.Header.Set("zgsm-request-id", requestID)
 	req.Header.Set("zgsm-task-id", ids.UUID())
@@ -563,7 +563,8 @@ func sendChatProbe(ctx context.Context, cfg config.Config, model, prompt string)
 	req.Header.Set("zgsm-provider", "costrict")
 	req.Header.Set("x-caller", "chat")
 	req.Header.Set("x-quota-identity", "system")
-	req.Header.Set("X-Costrict-Version", cfg.PluginVersion)
+	req.Header.Set("X-Costrict-Version", auth.NormalizePluginVersion(cfg.PluginVersion))
+	req.Header.Set("x-costrict-idea", auth.EditorType)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -1422,10 +1423,10 @@ func fetchModels(ctx context.Context, cfg config.Config) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	auth.ApplyDefaultHeaders(req.Header, cfg.PluginVersion)
 	req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
 	req.Header.Set("X-Request-ID", ids.UUID())
 	req.Header.Set("x-user-id", cfg.UserID)
-	req.Header.Set("User-Agent", "costrict-router/"+version.Current)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
